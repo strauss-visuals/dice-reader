@@ -10,6 +10,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import secrets
+import uuid
 import signal
 import threading
 import time
@@ -18,6 +19,7 @@ from contextlib import asynccontextmanager
 from typing import Literal
 
 import cv2
+import numpy as np
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -52,6 +54,8 @@ class RollPayload(BaseModel):
     total_score: int
     dice: list[DieResult]
     is_fallback: bool
+    roll_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    fallback_reason: str | None = None
 
 
 class SystemState(BaseModel):
@@ -78,14 +82,41 @@ class VisionTuningConfig(BaseModel):
     symbol_threshold_value: int = Field(default=127, ge=0, le=255)
 
 
-class AppConfig(BaseModel):
-    camera_index: int = Field(default=0, ge=0)
-    roi: list[int] | None = None
+class CalibrationProfile(BaseModel):
+    roi: list[int] | None = Field(default=None, min_length=4, max_length=4)
     vision: VisionTuningConfig = Field(default_factory=VisionTuningConfig)
 
 
+class AppConfig(BaseModel):
+    camera_index: int = Field(default=0, ge=0)
+    roi: list[int] | None = Field(default=None, min_length=4, max_length=4)
+    vision: VisionTuningConfig = Field(default_factory=VisionTuningConfig)
+    calibration_profiles: dict[str, CalibrationProfile] = Field(default_factory=dict)
+
+
+class CameraOption(BaseModel):
+    index: int
+    available: bool
+
+
+class CameraSelectRequest(BaseModel):
+    camera_index: int = Field(ge=0)
+
+
+class CalibrationProfileRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=40, pattern=r"^[A-Za-z0-9 _-]+$")
+
+
 class RoiConfig(BaseModel):
-    roi: list[int] | None = None
+    roi: list[int] | None = Field(default=None, min_length=4, max_length=4)
+
+
+class CalibrationQuality(BaseModel):
+    status: Literal["GOOD", "CHECK", "POOR"]
+    score: int = Field(ge=0, le=100)
+    message: str
+    motion_pixels: int
+    recent_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class RollHistoryItem(BaseModel):
@@ -95,6 +126,9 @@ class RollHistoryItem(BaseModel):
     is_fallback: bool
     dice_count: int
     dice: list[DieResult]
+    roll_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    fallback_reason: str | None = None
+    snapshot_id: str | None = None
 
 
 runtime_state = RuntimeState(
@@ -125,6 +159,8 @@ camera_index = 0
 camera_cleanup_done = False
 camera_thread: threading.Thread | None = None
 camera_stop_event = threading.Event()
+last_camera_reconnect_attempt: float = 0.0
+camera_reconnect_interval_seconds = 2.0
 
 latest_frame_lock = threading.Lock()
 latest_jpeg_frame: bytes | None = None
@@ -134,11 +170,95 @@ debug_dice_results: list[dict] = []
 latest_motion_pixels: int = 0
 config_path = Path("config.json")
 history = deque(maxlen=50)
+roll_snapshots: dict[str, bytes] = {}
+
+
+def append_history(payload: RollPayload, request_id: str | None, snapshot_bytes: bytes | None = None) -> None:
+    snapshot_id: str | None = None
+    if snapshot_bytes is not None:
+        snapshot_id = str(uuid.uuid4())
+        roll_snapshots[snapshot_id] = snapshot_bytes
+
+    item = RollHistoryItem(
+        timestamp_utc=datetime.now(timezone.utc).isoformat(),
+        request_id=request_id,
+        total_score=payload.total_score,
+        is_fallback=payload.is_fallback,
+        dice_count=len(payload.dice),
+        dice=payload.dice,
+        roll_confidence=payload.roll_confidence,
+        fallback_reason=payload.fallback_reason,
+        snapshot_id=snapshot_id,
+    )
+    history.append(item)
+
+    # Keep snapshot memory aligned with capped history window.
+    active_snapshot_ids = {entry.snapshot_id for entry in history if entry.snapshot_id}
+    stale_ids = [key for key in roll_snapshots.keys() if key not in active_snapshot_ids]
+    for stale_id in stale_ids:
+        del roll_snapshots[stale_id]
 
 
 def log_event(level: int, message: str, request_id: str | None = None) -> None:
     suffix = f" | request_id={request_id}" if request_id else ""
     logger.log(level, f"{message}{suffix}")
+
+
+def calculate_calibration_quality() -> CalibrationQuality:
+    if runtime_state.system.status == "ERROR":
+        return CalibrationQuality(
+            status="POOR",
+            score=0,
+            message=runtime_state.system.message or "Resolve the system error before calibration.",
+            motion_pixels=latest_motion_pixels,
+            recent_confidence=None,
+        )
+
+    with latest_frame_lock:
+        has_camera_frame = latest_raw_frame is not None
+    if not has_camera_frame:
+        return CalibrationQuality(
+            status="CHECK",
+            score=0,
+            message="Waiting for camera frames.",
+            motion_pixels=latest_motion_pixels,
+            recent_confidence=None,
+        )
+
+    vision_rolls = [item for item in history if not item.is_fallback and item.roll_confidence is not None]
+    recent_confidence = vision_rolls[-1].roll_confidence if vision_rolls else None
+    motion_limit = max(1, vision.config.motion_threshold)
+    motion_ratio = min(1.0, latest_motion_pixels / float(motion_limit))
+    score = 100 - int(motion_ratio * 50)
+
+    messages: list[str] = []
+    if latest_motion_pixels >= motion_limit:
+        messages.append("Tray is moving or lighting is unstable.")
+    if recent_confidence is not None:
+        score -= int((1.0 - recent_confidence) * 50)
+        if recent_confidence < 0.7:
+            messages.append("Recent symbol confidence is low.")
+
+    score = max(0, min(100, score))
+    if score >= 80:
+        return CalibrationQuality(
+            status="GOOD",
+            score=score,
+            message="Setup is stable for testing." if not messages else " ".join(messages),
+            motion_pixels=latest_motion_pixels,
+            recent_confidence=recent_confidence,
+        )
+    if score >= 55:
+        status: Literal["GOOD", "CHECK", "POOR"] = "CHECK"
+    else:
+        status = "POOR"
+    return CalibrationQuality(
+        status=status,
+        score=score,
+        message=" ".join(messages) or "Review ROI and threshold settings.",
+        motion_pixels=latest_motion_pixels,
+        recent_confidence=recent_confidence,
+    )
 
 
 def set_state(status: Literal["IDLE", "WATCHING", "CALCULATING", "ERROR"], message: str, active_dice_count: int) -> None:
@@ -375,18 +495,20 @@ def process_settled_frame(frame) -> None:
     symbol_to_score = {"+": 1, "-": -1, "blank": 0}
     total_score = sum(symbol_to_score[die.value] for die in dice)
 
-    payload = RollPayload(total_score=total_score, dice=dice, is_fallback=False)
-    schedule_coroutine(broadcast_event("ROLL_COMPLETE", payload.model_dump(), request_id=active_request_id))
-    history.append(
-        RollHistoryItem(
-            timestamp_utc=datetime.now(timezone.utc).isoformat(),
-            request_id=active_request_id,
-            total_score=payload.total_score,
-            is_fallback=payload.is_fallback,
-            dice_count=len(payload.dice),
-            dice=payload.dice,
-        )
+    roll_confidence = round(sum(die.confidence for die in dice) / max(1, len(dice)), 3)
+    payload = RollPayload(
+        total_score=total_score,
+        dice=dice,
+        is_fallback=False,
+        roll_confidence=roll_confidence,
+        fallback_reason=None,
     )
+    schedule_coroutine(broadcast_event("ROLL_COMPLETE", payload.model_dump(), request_id=active_request_id))
+    snapshot_bytes = None
+    ok, encoded = cv2.imencode(".jpg", draw_debug_overlay(frame.copy()))
+    if ok:
+        snapshot_bytes = encoded.tobytes()
+    append_history(payload, active_request_id, snapshot_bytes=snapshot_bytes)
     log_event(logging.INFO, f"Roll complete with score={payload.total_score}", request_id=active_request_id)
 
     cancel_task(watch_timeout_task)
@@ -400,7 +522,9 @@ def process_settled_frame(frame) -> None:
 
 
 def camera_worker_loop() -> None:
+    global last_camera_reconnect_attempt, latest_jpeg_frame, latest_raw_frame
     frame_interval = 1.0 / vision.config.processing_fps
+    frame_failure_started: float | None = None
 
     while not camera_stop_event.is_set():
         with camera_lock:
@@ -413,10 +537,28 @@ def camera_worker_loop() -> None:
                     frame = None
 
         if frame is None:
+            now = time.monotonic()
+            if frame_failure_started is None:
+                frame_failure_started = now
+            if now - frame_failure_started >= camera_reconnect_interval_seconds:
+                if runtime_state.system.status not in {"WATCHING", "CALCULATING"}:
+                    set_state(status="ERROR", message="Camera Not Providing Frames", active_dice_count=0)
+            if now - last_camera_reconnect_attempt >= camera_reconnect_interval_seconds:
+                last_camera_reconnect_attempt = now
+                if reconnect_camera():
+                    log_event(logging.INFO, f"Camera reconnected on index {camera_index}")
+                elif runtime_state.system.status != "ERROR":
+                    set_state(status="ERROR", message="Camera Not Found", active_dice_count=0)
             time.sleep(0.05)
             continue
 
-        global latest_raw_frame
+        frame_failure_started = None
+        if runtime_state.system.status == "ERROR" and runtime_state.system.message in {
+            "Camera Not Found",
+            "Camera Not Providing Frames",
+        }:
+            set_state(status="IDLE", message="Camera reconnected", active_dice_count=0)
+
         with latest_frame_lock:
             latest_raw_frame = frame.copy()
 
@@ -434,7 +576,6 @@ def camera_worker_loop() -> None:
         success, encoded = cv2.imencode(".jpg", display_frame)
         if success:
             with latest_frame_lock:
-                global latest_jpeg_frame
                 latest_jpeg_frame = encoded.tobytes()
 
         time.sleep(frame_interval)
@@ -452,6 +593,39 @@ def cleanup_camera() -> None:
         camera_cleanup_done = True
 
 
+def open_camera_device(index: int) -> cv2.VideoCapture | None:
+    candidate = cv2.VideoCapture(index)
+    if candidate is None or not candidate.isOpened():
+        if candidate is not None:
+            candidate.release()
+        return None
+    return candidate
+
+
+def switch_camera(index: int) -> bool:
+    global cap
+    with camera_lock:
+        previous = cap
+        replacement = open_camera_device(index)
+        if replacement is None:
+            return False
+
+        cap = replacement
+        if previous is not None and previous.isOpened():
+            previous.release()
+    return True
+
+
+def reconnect_camera() -> bool:
+    global cap
+    with camera_lock:
+        previous = cap
+        if previous is not None:
+            previous.release()
+        cap = open_camera_device(camera_index)
+        return cap is not None
+
+
 def handle_exit_signal(signum: int, _frame: object) -> None:
     logger.info("Received shutdown signal %s. Releasing camera.", signum)
     camera_stop_event.set()
@@ -460,31 +634,31 @@ def handle_exit_signal(signum: int, _frame: object) -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global camera_cleanup_done, camera_thread, cap, main_event_loop
+    global camera_cleanup_done, camera_thread, cap, last_camera_reconnect_attempt, main_event_loop
 
     main_event_loop = asyncio.get_running_loop()
     camera_cleanup_done = False
     camera_stop_event.clear()
-    startup_ok = True
+    last_camera_reconnect_attempt = 0.0
+    config_ok = True
 
     try:
         load_or_create_config()
     except (OSError, json.JSONDecodeError, ValueError) as error:
         logger.error("Config load failed during startup: %s", error)
         set_state(status="ERROR", message="Config Not Readable", active_dice_count=0)
-        startup_ok = False
+        config_ok = False
 
     with camera_lock:
-        cap = cv2.VideoCapture(camera_index)
-        if cap is None or not cap.isOpened():
+        cap = open_camera_device(camera_index)
+        if cap is None:
             logger.error("Could not open camera at index %s.", camera_index)
-            cap = None
         else:
             logger.info("Camera initialized at index %s.", camera_index)
 
-    startup_ok = startup_ok and run_startup_diagnostics()
+    run_startup_diagnostics()
 
-    if cap is not None and startup_ok:
+    if config_ok:
         camera_thread = threading.Thread(target=camera_worker_loop, name="camera-worker", daemon=True)
         camera_thread.start()
         log_event(logging.INFO, f"Camera worker started on index {camera_index}")
@@ -504,6 +678,14 @@ signal.signal(signal.SIGINT, handle_exit_signal)
 signal.signal(signal.SIGTERM, handle_exit_signal)
 
 
+def status_frame_bytes(message: str) -> bytes:
+    frame = np.full((360, 640, 3), (25, 31, 38), dtype=np.uint8)
+    cv2.putText(frame, "Camera Feed Unavailable", (42, 155), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (230, 230, 230), 2)
+    cv2.putText(frame, message, (42, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (100, 190, 255), 2)
+    success, encoded = cv2.imencode(".jpg", frame)
+    return encoded.tobytes() if success else b""
+
+
 def mjpeg_frame_generator(stage: Literal["raw", "motion_mask", "edges", "thresholded"]):
     previous_raw = None
     while True:
@@ -513,10 +695,13 @@ def mjpeg_frame_generator(stage: Literal["raw", "motion_mask", "edges", "thresho
 
         if raw is None:
             if frame_bytes is None:
+                placeholder_message = (
+                    runtime_state.system.message if runtime_state.system.status == "ERROR" else "Waiting for camera frames"
+                )
+                placeholder = status_frame_bytes(placeholder_message)
                 yield (
                     b"--frame\r\n"
-                    b"Content-Type: text/plain\r\n\r\n"
-                    b"Camera unavailable. Waiting for frames.\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" + placeholder + b"\r\n"
                 )
             else:
                 yield (
@@ -586,8 +771,40 @@ async def get_status() -> SystemState:
     return runtime_state.system
 
 
+@app.get("/api/calibration_quality", response_model=CalibrationQuality)
+async def get_calibration_quality() -> CalibrationQuality:
+    return calculate_calibration_quality()
+
+
 @app.get("/api/config", response_model=AppConfig)
 async def get_config() -> AppConfig:
+    return app_config
+
+
+@app.get("/api/cameras", response_model=list[CameraOption])
+def list_cameras() -> list[CameraOption]:
+    options: list[CameraOption] = []
+    for index in range(5):
+        probe = open_camera_device(index)
+        available = probe is not None
+        if probe is not None:
+            probe.release()
+        options.append(CameraOption(index=index, available=available))
+    return options
+
+
+@app.post("/api/camera", response_model=AppConfig)
+def update_camera(selection: CameraSelectRequest) -> AppConfig:
+    selected_index = selection.camera_index
+    if not switch_camera(selected_index):
+        log_event(logging.WARNING, f"Requested camera index {selected_index} is unavailable")
+        raise HTTPException(status_code=400, detail=f"Camera index {selected_index} is unavailable.")
+
+    app_config.camera_index = selected_index
+    apply_config_to_runtime()
+    write_config()
+    set_state(status="IDLE", message=f"Camera switched to index {selected_index}", active_dice_count=0)
+    log_event(logging.INFO, f"Camera switched to index {selected_index}")
     return app_config
 
 
@@ -604,9 +821,45 @@ async def update_roi(updated: RoiConfig) -> RoiConfig:
     return RoiConfig(roi=app_config.roi)
 
 
+@app.get("/api/calibration_profiles", response_model=dict[str, CalibrationProfile])
+async def get_calibration_profiles() -> dict[str, CalibrationProfile]:
+    return app_config.calibration_profiles
+
+
+@app.post("/api/calibration_profiles", response_model=CalibrationProfile)
+async def save_calibration_profile(request: CalibrationProfileRequest) -> CalibrationProfile:
+    profile = CalibrationProfile(roi=app_config.roi, vision=app_config.vision.model_copy(deep=True))
+    app_config.calibration_profiles[request.name] = profile
+    write_config()
+    log_event(logging.INFO, f"Calibration profile saved: {request.name}")
+    return profile
+
+
+@app.post("/api/calibration_profiles/apply", response_model=AppConfig)
+async def apply_calibration_profile(request: CalibrationProfileRequest) -> AppConfig:
+    profile = app_config.calibration_profiles.get(request.name)
+    if profile is None:
+        raise HTTPException(status_code=404, detail=f"Calibration profile '{request.name}' not found.")
+
+    app_config.roi = profile.roi
+    app_config.vision = profile.vision.model_copy(deep=True)
+    apply_config_to_runtime()
+    write_config()
+    log_event(logging.INFO, f"Calibration profile applied: {request.name}")
+    return app_config
+
+
 @app.get("/api/history", response_model=list[RollHistoryItem])
 async def get_history() -> list[RollHistoryItem]:
     return list(history)
+
+
+@app.get("/api/history/{snapshot_id}/snapshot.jpg")
+async def get_history_snapshot(snapshot_id: str) -> StreamingResponse:
+    snapshot = roll_snapshots.get(snapshot_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Snapshot not found.")
+    return StreamingResponse(io.BytesIO(snapshot), media_type="image/jpeg")
 
 
 @app.get("/api/export_diagnostics")
@@ -682,18 +935,10 @@ async def fallback_roll() -> dict:
         active_dice_count=runtime_state.expected_dice_count,
     )
     fallback_payload = generate_fallback_roll(runtime_state.expected_dice_count)
+    fallback_payload.fallback_reason = "MANUAL_FALLBACK_TRIGGERED"
 
     await broadcast_event("ROLL_COMPLETE", fallback_payload.model_dump(), request_id=active_request_id)
-    history.append(
-        RollHistoryItem(
-            timestamp_utc=datetime.now(timezone.utc).isoformat(),
-            request_id=active_request_id,
-            total_score=fallback_payload.total_score,
-            is_fallback=fallback_payload.is_fallback,
-            dice_count=len(fallback_payload.dice),
-            dice=fallback_payload.dice,
-        )
-    )
+    append_history(fallback_payload, active_request_id, snapshot_bytes=None)
     log_event(logging.INFO, f"Fallback roll complete with score={fallback_payload.total_score}", request_id=active_request_id)
 
     set_state(status="IDLE", message="Fallback roll complete", active_dice_count=0)
@@ -806,3 +1051,9 @@ async def game_bridge(websocket: WebSocket) -> None:
         vision.reset_motion_history()
         game_bridge_socket = None
         log_event(logging.INFO, f"Game bridge disconnected: {websocket.client}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="127.0.0.1", port=8000)
