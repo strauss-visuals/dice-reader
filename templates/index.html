@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Optical Fate Dice Reader - Troubleshooting</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 2rem;
+      background: #f5f5f5;
+      color: #222;
+    }
+
+    .card {
+      max-width: 720px;
+      margin: 0 auto;
+      background: white;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 1.5rem;
+    }
+
+    h1 {
+      margin-top: 0;
+      font-size: 1.5rem;
+    }
+
+    code {
+      background: #efefef;
+      padding: 0.1rem 0.35rem;
+      border-radius: 4px;
+    }
+
+    .videoFeed {
+      width: 100%;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      margin: 1rem 0;
+      background: #000;
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>Optical Fate Dice Reader</h1>
+    <p>This is the troubleshooting UI placeholder.</p>
+    <p>WebSocket bridge endpoint: <code>/ws/game-bridge</code></p>
+    <img class="videoFeed" src="/video_feed" alt="Live camera stream" />
+    <button id="fallbackButton" type="button">Generate Random Roll</button>
+    <pre id="result"></pre>
+  </main>
+  <script>
+    const fallbackButton = document.getElementById("fallbackButton");
+    const result = document.getElementById("result");
+
+    fallbackButton.addEventListener("click", async () => {
+      result.textContent = "Generating fallback roll...";
+      try {
+        const response = await fetch("/api/fallback_roll", { method: "POST" });
+        const data = await response.json();
+        result.textContent = JSON.stringify(data, null, 2);
+      } catch (error) {
+        result.textContent = `Request failed: ${error}`;
+      }
+    });
+  </script>
+</body>
+</html>
