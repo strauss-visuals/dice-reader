@@ -1,0 +1,15 @@
+{
+  "camera_index": 0,
+  "roi": [
+    10,
+    20,
+    300,
+    220
+  ],
+  "vision": {
+    "motion_threshold": 1200,
+    "contour_min_area": 500,
+    "contour_max_area": 30000,
+    "symbol_threshold_value": 127
+  }
+}

@@ -5,19 +5,31 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Optical Fate Dice Reader - Troubleshooting</title>
   <style>
+    :root {
+      --bg: #f3f5f7;
+      --surface: #ffffff;
+      --text: #222;
+      --muted: #6a7280;
+      --border: #d8dee6;
+      --ok: #1f8f4b;
+      --warn: #d07900;
+      --busy: #1a6fdc;
+      --error: #c83333;
+    }
+
     body {
-      font-family: Arial, sans-serif;
+      font-family: "Segoe UI", Tahoma, sans-serif;
       margin: 0;
-      padding: 2rem;
-      background: #f5f5f5;
-      color: #222;
+      padding: 1.5rem;
+      background: var(--bg);
+      color: var(--text);
     }
 
     .card {
-      max-width: 720px;
+      max-width: 940px;
       margin: 0 auto;
-      background: white;
-      border: 1px solid #ddd;
+      background: var(--surface);
+      border: 1px solid var(--border);
       border-radius: 8px;
       padding: 1.5rem;
     }
@@ -25,6 +37,66 @@
     h1 {
       margin-top: 0;
       font-size: 1.5rem;
+    }
+
+    .statusPanel {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+      margin: 1rem 0;
+      background: #fafbfd;
+    }
+
+    .statusRow {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+
+    .statusPill {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 0.25rem 0.7rem;
+      font-weight: 600;
+      border: 1px solid transparent;
+      min-width: 110px;
+      text-align: center;
+    }
+
+    .status-IDLE {
+      color: var(--ok);
+      border-color: #a7d9ba;
+      background: #effaf3;
+    }
+
+    .status-WATCHING {
+      color: var(--busy);
+      border-color: #b8d3f6;
+      background: #edf4ff;
+    }
+
+    .status-CALCULATING {
+      color: var(--warn);
+      border-color: #efd3a4;
+      background: #fff8ed;
+    }
+
+    .status-ERROR {
+      color: var(--error);
+      border-color: #f0b5b5;
+      background: #fff0f0;
+    }
+
+    .statusReason {
+      margin: 0.6rem 0 0;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .statusReason.error {
+      color: var(--error);
+      font-weight: 600;
     }
 
     code {
@@ -40,31 +112,157 @@
       margin: 1rem 0;
       background: #000;
     }
+
+    .controlsRow {
+      display: flex;
+      gap: 0.75rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .tuningGrid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 0.9rem;
+      margin: 1rem 0 0.5rem;
+    }
+
+    .controlBlock {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.7rem;
+      background: #fcfdff;
+    }
+
+    .controlBlock label {
+      display: block;
+      font-size: 0.88rem;
+      color: var(--muted);
+      margin-bottom: 0.35rem;
+    }
+
+    .controlBlock output {
+      font-weight: 600;
+      color: var(--text);
+      margin-left: 0.45rem;
+    }
+
+    .controlBlock input,
+    .controlBlock select {
+      width: 100%;
+    }
+
+    button {
+      border: 1px solid #b7c1cf;
+      background: #fff;
+      color: #1a202b;
+      border-radius: 6px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      padding: 0.55rem 0.85rem;
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: #f8fbff;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 0.8rem;
+      font-size: 0.9rem;
+    }
+
+    th,
+    td {
+      border: 1px solid var(--border);
+      padding: 0.45rem;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #f5f8fc;
+      font-weight: 600;
+    }
   </style>
 </head>
 <body>
   <main class="card">
     <h1>Optical Fate Dice Reader</h1>
-    <p>This is the troubleshooting UI placeholder.</p>
+    <p>Troubleshooting Dashboard</p>
     <p>WebSocket bridge endpoint: <code>/ws/game-bridge</code></p>
-    <img class="videoFeed" src="/video_feed" alt="Live camera stream" />
-    <button id="fallbackButton" type="button">Generate Random Roll</button>
+
+    <section class="statusPanel" aria-label="System Status">
+      <div class="statusRow">
+        <strong>System Status</strong>
+        <span id="statusPill" class="statusPill status-IDLE">IDLE</span>
+      </div>
+      <p id="statusReason" class="statusReason">Waiting for status...</p>
+    </section>
+
+    <section class="statusPanel" aria-label="Vision Calibration">
+      <div class="statusRow">
+        <strong>Vision Calibration</strong>
+      </div>
+      <div class="tuningGrid">
+        <div class="controlBlock">
+          <label for="stageSelect">Feed View</label>
+          <select id="stageSelect">
+            <option value="raw">Raw</option>
+            <option value="motion_mask">Motion Mask</option>
+            <option value="edges">Edges</option>
+            <option value="thresholded">Thresholded</option>
+          </select>
+        </div>
+        <div class="controlBlock">
+          <label for="motionThreshold">Motion Threshold <output id="motionThresholdValue"></output></label>
+          <input id="motionThreshold" type="range" min="50" max="6000" step="10" />
+        </div>
+        <div class="controlBlock">
+          <label for="contourMinArea">Contour Min Area <output id="contourMinAreaValue"></output></label>
+          <input id="contourMinArea" type="range" min="100" max="5000" step="25" />
+        </div>
+        <div class="controlBlock">
+          <label for="contourMaxArea">Contour Max Area <output id="contourMaxAreaValue"></output></label>
+          <input id="contourMaxArea" type="range" min="5000" max="80000" step="100" />
+        </div>
+        <div class="controlBlock">
+          <label for="symbolThresholdValue">Symbol Threshold <output id="symbolThresholdValueOut"></output></label>
+          <input id="symbolThresholdValue" type="range" min="0" max="255" step="1" />
+        </div>
+      </div>
+    </section>
+
+    <img id="videoFeed" class="videoFeed" src="/video_feed?stage=raw" alt="Live camera stream" />
+    <div class="controlsRow">
+      <button id="fallbackButton" type="button">Generate Random Roll</button>
+      <button id="exportDiagnosticsButton" type="button">Export Diagnostics</button>
+    </div>
+
+    <section class="statusPanel" aria-label="Recent Rolls">
+      <div class="statusRow">
+        <strong>Recent Rolls</strong>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Time (UTC)</th>
+            <th>Request ID</th>
+            <th>Total</th>
+            <th>Fallback</th>
+            <th>Dice</th>
+          </tr>
+        </thead>
+        <tbody id="historyBody">
+          <tr><td colspan="5">No rolls yet.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
     <pre id="result"></pre>
   </main>
-  <script>
-    const fallbackButton = document.getElementById("fallbackButton");
-    const result = document.getElementById("result");
-
-    fallbackButton.addEventListener("click", async () => {
-      result.textContent = "Generating fallback roll...";
-      try {
-        const response = await fetch("/api/fallback_roll", { method: "POST" });
-        const data = await response.json();
-        result.textContent = JSON.stringify(data, null, 2);
-      } catch (error) {
-        result.textContent = `Request failed: ${error}`;
-      }
-    });
-  </script>
+  <script src="/app.js"></script>
 </body>
 </html>

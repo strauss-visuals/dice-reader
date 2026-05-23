@@ -9,13 +9,14 @@ import numpy as np
 
 @dataclass
 class VisionConfig:
-    motion_pixel_threshold: int = 1200
+    motion_threshold: int = 1200
     motion_diff_threshold: int = 30
     motion_intensity_shift_threshold: float = 20.0
     settlement_seconds: float = 1.5
     processing_fps: float = 30.0
-    die_min_area: int = 500
-    die_max_area: int = 30000
+    contour_min_area: int = 500
+    contour_max_area: int = 30000
+    symbol_threshold_value: int = 127
     blank_pixel_ratio_threshold: float = 0.03
     line_peak_threshold: float = 0.38
     minimum_confidence: float = 0.55
@@ -56,7 +57,7 @@ class VisionProcessor:
 
         if self.previous_gray is None:
             self.previous_gray = gray
-            return self.config.motion_pixel_threshold + 1
+            return self.config.motion_threshold + 1
 
         previous_mean = float(np.mean(self.previous_gray))
         current_mean = float(np.mean(gray))
@@ -74,7 +75,7 @@ class VisionProcessor:
         return motion_pixels
 
     def update_settlement(self, motion_pixels: int) -> bool:
-        if motion_pixels < self.config.motion_pixel_threshold:
+        if motion_pixels < self.config.motion_threshold:
             self.low_motion_frames += 1
         else:
             self.low_motion_frames = 0
@@ -94,7 +95,7 @@ class VisionProcessor:
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
             area = w * h
-            if area < self.config.die_min_area or area > self.config.die_max_area:
+            if area < self.config.contour_min_area or area > self.config.contour_max_area:
                 continue
 
             aspect_ratio = w / float(h)
@@ -109,7 +110,7 @@ class VisionProcessor:
     def classify_symbol(self, die_crop: np.ndarray) -> tuple[str, float]:
         gray = cv2.cvtColor(die_crop, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (3, 3), 0)
-        _, binary_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        _, binary_inv = cv2.threshold(gray, self.config.symbol_threshold_value, 255, cv2.THRESH_BINARY_INV)
         kernel = np.ones((3, 3), np.uint8)
         binary_inv = cv2.morphologyEx(binary_inv, cv2.MORPH_OPEN, kernel, iterations=1)
 
@@ -169,3 +170,28 @@ class VisionProcessor:
             )
 
         return results
+
+    def motion_mask_from_pair(self, previous_frame: np.ndarray, current_frame: np.ndarray) -> np.ndarray:
+        prev = cv2.cvtColor(previous_frame, cv2.COLOR_BGR2GRAY)
+        prev = cv2.GaussianBlur(prev, (5, 5), 0)
+        curr = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
+        curr = cv2.GaussianBlur(curr, (5, 5), 0)
+        delta = cv2.absdiff(prev, curr)
+        _, thresh = cv2.threshold(delta, self.config.motion_diff_threshold, 255, cv2.THRESH_BINARY)
+        return thresh
+
+    def edges_view(self, frame: np.ndarray) -> np.ndarray:
+        roi_x, roi_y, roi_w, roi_h = self._resolve_roi(frame)
+        roi_frame = frame[roi_y : roi_y + roi_h, roi_x : roi_x + roi_w]
+        gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blur, 50, 150)
+        return edges
+
+    def thresholded_view(self, frame: np.ndarray) -> np.ndarray:
+        roi_x, roi_y, roi_w, roi_h = self._resolve_roi(frame)
+        roi_frame = frame[roi_y : roi_y + roi_h, roi_x : roi_x + roi_w]
+        gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        _, binary_inv = cv2.threshold(gray, self.config.symbol_threshold_value, 255, cv2.THRESH_BINARY_INV)
+        return binary_inv
