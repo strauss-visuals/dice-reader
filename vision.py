@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -18,6 +19,7 @@ class VisionConfig:
     blank_pixel_ratio_threshold: float = 0.03
     line_peak_threshold: float = 0.38
     minimum_confidence: float = 0.55
+    roi: Optional[tuple[int, int, int, int]] = None
 
 
 class VisionProcessor:
@@ -34,8 +36,22 @@ class VisionProcessor:
         self.previous_gray = None
         self.low_motion_frames = 0
 
+    def _resolve_roi(self, frame: np.ndarray) -> tuple[int, int, int, int]:
+        frame_h, frame_w = frame.shape[:2]
+        if self.config.roi is None:
+            return 0, 0, frame_w, frame_h
+
+        x, y, w, h = self.config.roi
+        x = max(0, min(x, frame_w - 1))
+        y = max(0, min(y, frame_h - 1))
+        w = max(1, min(w, frame_w - x))
+        h = max(1, min(h, frame_h - y))
+        return x, y, w, h
+
     def detect_motion(self, frame: np.ndarray) -> int:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        x, y, w, h = self._resolve_roi(frame)
+        roi_frame = frame[y : y + h, x : x + w]
+        gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
         if self.previous_gray is None:
@@ -66,7 +82,9 @@ class VisionProcessor:
         return self.low_motion_frames >= self.required_settlement_frames
 
     def find_dice_contours(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        roi_x, roi_y, roi_w, roi_h = self._resolve_roi(frame)
+        roi_frame = frame[roi_y : roi_y + roi_h, roi_x : roi_x + roi_w]
+        gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
         edges = cv2.Canny(blur, 50, 150)
 
@@ -83,7 +101,7 @@ class VisionProcessor:
             if not 0.65 <= aspect_ratio <= 1.45:
                 continue
 
-            dice_boxes.append((x, y, w, h))
+            dice_boxes.append((x + roi_x, y + roi_y, w, h))
 
         dice_boxes.sort(key=lambda box: (box[1], box[0]))
         return dice_boxes

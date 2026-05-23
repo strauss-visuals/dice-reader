@@ -63,6 +63,7 @@ vision = VisionProcessor(VisionConfig())
 game_bridge_socket: WebSocket | None = None
 watch_timeout_task: asyncio.Task | None = None
 error_reset_task: asyncio.Task | None = None
+heartbeat_task: asyncio.Task | None = None
 main_event_loop: asyncio.AbstractEventLoop | None = None
 
 cap: cv2.VideoCapture | None = None
@@ -131,6 +132,10 @@ def draw_debug_overlay(frame):
         (255, 255, 0),
         2,
     )
+    if vision.config.roi is not None:
+        roi_x, roi_y, roi_w, roi_h = vision.config.roi
+        cv2.rectangle(frame, (roi_x, roi_y), (roi_x + roi_w, roi_y + roi_h), (255, 0, 255), 2)
+        cv2.putText(frame, "ROI", (roi_x, max(20, roi_y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2)
 
     for item in current_results:
         x, y, w, h = item["bbox"]
@@ -149,6 +154,17 @@ async def broadcast_event(event_name: str, payload: dict) -> None:
         await game_bridge_socket.send_json({"event": event_name, "data": payload})
     except Exception as error:  # pragma: no cover - best effort socket send
         logger.warning("Failed to broadcast %s: %s", event_name, error)
+
+
+async def heartbeat_loop(interval_seconds: int = 10) -> None:
+    try:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            if game_bridge_socket is not None:
+                await broadcast_event("PING", {"ts": int(time.time())})
+    except asyncio.CancelledError:
+        logger.info("Heartbeat task cancelled.")
+        raise
 
 
 def generate_fallback_roll(expected_dice_count: int) -> RollPayload:
@@ -390,9 +406,11 @@ async def fallback_roll() -> dict:
 
 @app.websocket("/ws/game-bridge")
 async def game_bridge(websocket: WebSocket) -> None:
-    global error_reset_task, game_bridge_socket, watch_timeout_task
+    global error_reset_task, game_bridge_socket, heartbeat_task, watch_timeout_task
     await websocket.accept()
     game_bridge_socket = websocket
+    cancel_task(heartbeat_task)
+    heartbeat_task = asyncio.create_task(heartbeat_loop())
     logger.info("Game bridge connected: %s", websocket.client)
 
     try:
@@ -436,6 +454,8 @@ async def game_bridge(websocket: WebSocket) -> None:
                         },
                     }
                 )
+            elif parsed.action == "PING":
+                await websocket.send_json({"event": "PONG", "data": {"ts": int(time.time())}})
             else:
                 await websocket.send_json(
                     {
@@ -444,6 +464,8 @@ async def game_bridge(websocket: WebSocket) -> None:
                     }
                 )
     except WebSocketDisconnect:
+        cancel_task(heartbeat_task)
+        heartbeat_task = None
         cancel_task(watch_timeout_task)
         watch_timeout_task = None
         cancel_task(error_reset_task)
