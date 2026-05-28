@@ -1,0 +1,145 @@
+{
+  "schemaVersion": "dice-reader.report.v1",
+  "reportType": "live_soak_verify",
+  "generatedAt": "2026-05-26T23:25:38.698629+00:00",
+  "startedAt": "2026-05-26T23:25:37.148376+00:00",
+  "durationMs": 1550.28,
+  "target": {
+    "baseUrl": "http://127.0.0.1:8000",
+    "wsUrl": "ws://127.0.0.1:8000/ws/game-bridge"
+  },
+  "totals": {
+    "runs": 100,
+    "failures": 0,
+    "pass": true
+  },
+  "latency": {
+    "ackMs": {
+      "min": 2.3,
+      "avg": 2.99,
+      "p95": 3.59,
+      "p99": 4.0,
+      "max": 4.49
+    },
+    "completeMs": {
+      "min": 10.28,
+      "avg": 14.08,
+      "p95": 21.12,
+      "p99": 22.0,
+      "max": 124.29
+    }
+  },
+  "failures": [],
+  "sampleRuns": [
+    {
+      "request_id": "soak100-001",
+      "expected_dice_count": 4,
+      "ack_ms": 3.587100000004284,
+      "complete_ms": 124.28870000007919,
+      "ack_ok": true,
+      "complete_ok": true,
+      "fallback_http_ok": true,
+      "fallback_event": "ROLL_COMPLETE",
+      "total_score": 2
+    },
+    {
+      "request_id": "soak100-002",
+      "expected_dice_count": 3,
+      "ack_ms": 3.0853999999180814,
+      "complete_ms": 12.107499999956417,
+      "ack_ok": true,
+      "complete_ok": true,
+      "fallback_http_ok": true,
+      "fallback_event": "ROLL_COMPLETE",
+      "total_score": -1
+    },
+    {
+      "request_id": "soak100-003",
+      "expected_dice_count": 4,
+      "ack_ms": 2.8902999999900203,
+      "complete_ms": 12.067200000046796,
+      "ack_ok": true,
+      "complete_ok": true,
+      "fallback_http_ok": true,
+      "fallback_event": "ROLL_COMPLETE",
+      "total_score": -1
+    },
+    {
+      "request_id": "soak100-004",
+      "expected_dice_count": 3,
+      "ack_ms": 3.9068999999472,
+      "complete_ms": 12.680699999918943,
+      "ack_ok": true,
+      "complete_ok": true,
+      "fallback_http_ok": true,
+      "fallback_event": "ROLL_COMPLETE",
+      "total_score": 0
+    },
+    {
+      "request_id": "soak100-005",
+      "expected_dice_count": 3,
+      "ack_ms": 2.6956000001518987,
+      "complete_ms": 11.835100000098464,
+      "ack_ok": true,
+      "complete_ok": true,
+      "fallback_http_ok": true,
+      "fallback_event": "ROLL_COMPLETE",
+      "total_score": 2
+    },
+    {
+      "request_id": "soak100-006",
+      "expected_dice_count": 3,
+      "ack_ms": 2.649700000119992,
+      "complete_ms": 12.13940000002367,
+      "ack_ok": true,
+      "complete_ok": true,
+      "fallback_http_ok": true,
+      "fallback_event": "ROLL_COMPLETE",
+      "total_score": 1
+    },
+    {
+      "request_id": "soak100-007",
+      "expected_dice_count": 3,
+      "ack_ms": 2.7546999999685795,
+      "complete_ms": 10.565699999915523,
+      "ack_ok": true,
+      "complete_ok": true,
+      "fallback_http_ok": true,
+      "fallback_event": "ROLL_COMPLETE",
+      "total_score": 1
+    },
+    {
+      "request_id": "soak100-008",
+      "expected_dice_count": 3,
+      "ack_ms": 2.453400000149486,
+      "complete_ms": 21.396000000095228,
+      "ack_ok": true,
+      "complete_ok": true,
+      "fallback_http_ok": true,
+      "fallback_event": "ROLL_COMPLETE",
+      "total_score": 0
+    },
+    {
+      "request_id": "soak100-009",
+      "expected_dice_count": 4,
+      "ack_ms": 3.581200000098761,
+      "complete_ms": 11.991699999953198,
+      "ack_ok": true,
+      "complete_ok": true,
+      "fallback_http_ok": true,
+      "fallback_event": "ROLL_COMPLETE",
+      "total_score": 4
+    },
+    {
+      "request_id": "soak100-010",
+      "expected_dice_count": 4,
+      "ack_ms": 2.939299999979994,
+      "complete_ms": 11.860200000000987,
+      "ack_ok": true,
+      "complete_ok": true,
+      "fallback_http_ok": true,
+      "fallback_event": "ROLL_COMPLETE",
+      "total_score": 1
+    }
+  ]
+}
