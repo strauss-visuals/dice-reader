@@ -152,6 +152,27 @@
       flex-wrap: wrap;
     }
 
+    .uploadGrid {
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr);
+      gap: 1rem;
+      align-items: start;
+      margin-top: 0.75rem;
+    }
+
+    .uploadPreview {
+      width: 100%;
+      max-height: 320px;
+      object-fit: contain;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: #000;
+    }
+
+    .uploadPreview[hidden] {
+      display: none;
+    }
+
     .wizardStep {
       margin-top: 0.75rem;
       padding: 0.75rem;
@@ -199,8 +220,24 @@
     }
 
     .controlBlock input,
-    .controlBlock select {
+    .controlBlock select,
+    .controlBlock textarea {
       width: 100%;
+    }
+
+    .controlBlock textarea {
+      min-height: 160px;
+      box-sizing: border-box;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 0.9rem;
+      resize: vertical;
+    }
+
+    .bridgeLog {
+      min-height: 220px;
+      max-height: 360px;
+      overflow: auto;
+      white-space: pre-wrap;
     }
 
     button {
@@ -294,6 +331,12 @@
       border-radius: 6px;
       background: #000;
     }
+
+    @media (max-width: 700px) {
+      .uploadGrid {
+        grid-template-columns: 1fr;
+      }
+    }
   </style>
 </head>
 <body>
@@ -350,12 +393,21 @@
             <option value="raw">Raw</option>
             <option value="motion_mask">Motion Mask</option>
             <option value="edges">Edges</option>
+            <option value="contours">Contours</option>
             <option value="thresholded">Thresholded</option>
           </select>
         </div>
         <div class="controlBlock">
           <label for="motionThreshold">Motion Threshold <output id="motionThresholdValue"></output></label>
           <input id="motionThreshold" type="range" min="50" max="6000" step="10" />
+        </div>
+        <div class="controlBlock">
+          <label for="motionDiffThreshold">Motion Diff Threshold <output id="motionDiffThresholdValue"></output></label>
+          <input id="motionDiffThreshold" type="range" min="5" max="100" step="1" />
+        </div>
+        <div class="controlBlock">
+          <label for="settlementSeconds">Settlement Seconds <output id="settlementSecondsValue"></output></label>
+          <input id="settlementSeconds" type="range" min="0.2" max="3" step="0.1" />
         </div>
         <div class="controlBlock">
           <label for="contourMinArea">Contour Min Area <output id="contourMinAreaValue"></output></label>
@@ -405,6 +457,72 @@
             <button id="saveProfileButton" type="button">Save</button>
             <button id="loadProfileButton" type="button">Load</button>
           </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="statusPanel" aria-label="Still Image Troubleshooting">
+      <div class="statusRow">
+        <strong>Still Image Troubleshooting</strong>
+      </div>
+      <p class="wizardHint">Upload one photo to run the same roll response shape without using the live camera.</p>
+      <div class="uploadGrid">
+        <div>
+          <div class="controlsRow">
+            <input id="stillImageInput" type="file" accept="image/*" />
+            <button id="stillImageButton" type="button">Analyze Image</button>
+          </div>
+          <pre id="stillImageResult"></pre>
+        </div>
+        <img id="stillImagePreview" class="uploadPreview" alt="Selected still image preview" hidden />
+      </div>
+    </section>
+
+    <section class="statusPanel" aria-label="Game Bridge Troubleshooting">
+      <div class="statusRow">
+        <strong>Game Bridge Troubleshooting</strong>
+        <span id="bridgeStatusPill" class="statusPill status-IDLE">DISCONNECTED</span>
+      </div>
+      <p class="wizardHint">Send and inspect the minimal JSON protocol for <code>/ws/game-bridge</code>.</p>
+      <div class="tuningGrid">
+        <div class="controlBlock">
+          <label for="bridgeRequestId">Request ID</label>
+          <input id="bridgeRequestId" type="text" />
+        </div>
+        <div class="controlBlock">
+          <label for="bridgeDiceCount">Expected Dice Count</label>
+          <input id="bridgeDiceCount" type="number" min="1" value="3" />
+        </div>
+        <div class="controlBlock">
+          <label for="bridgeTimeoutSeconds">Timeout Seconds</label>
+          <input id="bridgeTimeoutSeconds" type="number" min="1" value="30" />
+        </div>
+        <div class="controlBlock">
+          <label>Connection</label>
+          <div class="controlsRow">
+            <button id="bridgeConnectButton" type="button">Connect</button>
+            <button id="bridgeDisconnectButton" type="button">Disconnect</button>
+          </div>
+        </div>
+      </div>
+      <div class="controlsRow">
+        <button id="bridgeConnectMessageButton" type="button">Send Connect</button>
+        <button id="bridgePingButton" type="button">Send Ping</button>
+        <button id="bridgeConfigButton" type="button">Send Config</button>
+        <button id="bridgeRollButton" type="button">Request Roll</button>
+        <button id="bridgeClearLogButton" type="button">Clear Log</button>
+      </div>
+      <div class="uploadGrid">
+        <div class="controlBlock">
+          <label for="bridgeMessageInput">Editable JSON Message</label>
+          <textarea id="bridgeMessageInput" spellcheck="false"></textarea>
+          <div class="controlsRow">
+            <button id="bridgeSendCustomButton" type="button">Send JSON</button>
+          </div>
+        </div>
+        <div class="controlBlock">
+          <label for="bridgeMessageLog">Message Log</label>
+          <pre id="bridgeMessageLog" class="bridgeLog"></pre>
         </div>
       </div>
     </section>

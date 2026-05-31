@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from uuid import uuid4
 
+import cv2
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -30,11 +32,13 @@ def isolated_config_file(tmp_path, monkeypatch):
     temporary_config.write_text(json.dumps(original_config.model_dump()), encoding="utf-8")
     monkeypatch.setattr(main, "config_path", temporary_config)
     monkeypatch.setattr(main, "open_camera_device", lambda index: FakeCapture() if index == 0 else None)
+    main.runtime_state.expected_dice_count = 3
     main.history.clear()
     main.roll_snapshots.clear()
     yield
     main.cap = None
     main.app_config = original_config
+    main.runtime_state.expected_dice_count = 3
     main.apply_config_to_runtime()
     main.history.clear()
     main.roll_snapshots.clear()
@@ -174,6 +178,73 @@ def test_history_snapshot_endpoint_returns_stored_jpeg() -> None:
         assert response.headers["content-type"] == "image/jpeg"
 
 
+def test_still_image_roll_accepts_one_image(monkeypatch) -> None:
+    monkeypatch.setattr(
+        main.vision,
+        "calculate_roll_from_still_image",
+        lambda frame: [{"value": "+", "confidence": 0.82, "bbox": [5, 6, 40, 40]}],
+    )
+    image = np.zeros((80, 80, 3), dtype=np.uint8)
+    ok, encoded = cv2.imencode(".jpg", image)
+    assert ok
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/api/still_image_roll",
+            content=encoded.tobytes(),
+            headers={"Content-Type": "image/jpeg"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "total_score": 1,
+        "dice": [{"value": "+", "confidence": 0.82, "bbox": [5, 6, 40, 40]}],
+        "is_fallback": False,
+        "roll_confidence": 0.82,
+        "fallback_reason": None,
+    }
+    assert main.history[-1].request_id == "still-image-upload"
+
+
+def test_still_image_roll_rejects_unreadable_image() -> None:
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/api/still_image_roll",
+            content=b"not an image",
+            headers={"Content-Type": "image/jpeg"},
+        )
+
+    assert response.status_code == 400
+    assert "not a readable image" in response.json()["detail"]
+
+
+def test_settlement_tolerates_small_camera_noise() -> None:
+    processor = main.VisionProcessor(
+        main.VisionConfig(
+            motion_threshold=100,
+            settlement_seconds=1.0,
+        )
+    )
+
+    assert processor.update_settlement(10, now_seconds=0.0) is False
+    assert processor.update_settlement(120, now_seconds=0.4) is False
+    assert processor.update_settlement(20, now_seconds=1.1) is True
+
+
+def test_settlement_resets_when_motion_resumes() -> None:
+    processor = main.VisionProcessor(
+        main.VisionConfig(
+            motion_threshold=100,
+            settlement_seconds=1.0,
+        )
+    )
+
+    assert processor.update_settlement(10, now_seconds=0.0) is False
+    assert processor.update_settlement(200, now_seconds=0.4) is False
+    assert processor.update_settlement(10, now_seconds=1.1) is False
+    assert processor.update_settlement(10, now_seconds=2.2) is True
+
+
 def test_reconnect_camera_releases_old_capture_and_reopens_configured_device(monkeypatch) -> None:
     class FakeCapture:
         def __init__(self) -> None:
@@ -204,14 +275,18 @@ def test_websocket_request_ack_and_fallback_roll_complete() -> None:
     with TestClient(main.app) as client:
         request_id = str(uuid4())
         with client.websocket_connect("/ws/game-bridge") as websocket:
+            connected = websocket.receive_json()
+            assert connected["type"] == "connect.ok"
+
             websocket.send_json(
                 {
-                    "action": "REQUEST_ROLL",
+                    "type": "roll.request",
                     "request_id": request_id,
                     "config": {"expected_dice_count": 3, "timeout_seconds": 30},
                 }
             )
             ack = websocket.receive_json()
+            assert ack["type"] == "roll.ack"
             assert ack["event"] == "ROLL_ACK"
             assert ack["request_id"] == request_id
             assert ack["data"]["expected_dice_count"] == 3
@@ -220,9 +295,38 @@ def test_websocket_request_ack_and_fallback_roll_complete() -> None:
             assert fallback_response.status_code == 200
 
             complete = websocket.receive_json()
+            assert complete["type"] == "roll.result"
             assert complete["event"] == "ROLL_COMPLETE"
             assert complete["request_id"] == request_id
             assert complete["data"]["is_fallback"] is True
             assert complete["data"]["roll_confidence"] is None
             assert complete["data"]["fallback_reason"] == "MANUAL_FALLBACK_TRIGGERED"
             assert len(complete["data"]["dice"]) == 3
+
+
+def test_websocket_ping_and_config_update_protocol() -> None:
+    with TestClient(main.app) as client:
+        with client.websocket_connect("/ws/game-bridge") as websocket:
+            connected = websocket.receive_json()
+            assert connected["type"] == "connect.ok"
+
+            websocket.send_json({"type": "ping", "request_id": "ping-001"})
+            pong = websocket.receive_json()
+            assert pong["type"] == "pong"
+            assert pong["event"] == "PONG"
+            assert pong["request_id"] == "ping-001"
+            assert "ts" in pong["data"]
+
+            websocket.send_json(
+                {
+                    "type": "config.update",
+                    "request_id": "config-001",
+                    "config": {"expected_dice_count": 4, "timeout_seconds": 12},
+                }
+            )
+            updated = websocket.receive_json()
+            assert updated["type"] == "config.updated"
+            assert updated["request_id"] == "config-001"
+            assert updated["data"]["expected_dice_count"] == 4
+            assert updated["data"]["timeout_seconds"] == 12
+            assert main.runtime_state.expected_dice_count == 4

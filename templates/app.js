@@ -10,10 +10,14 @@ const roiCanvas = document.getElementById("roiCanvas");
 const cameraSelect = document.getElementById("cameraSelect");
 const stageSelect = document.getElementById("stageSelect");
 const motionThreshold = document.getElementById("motionThreshold");
+const motionDiffThreshold = document.getElementById("motionDiffThreshold");
+const settlementSeconds = document.getElementById("settlementSeconds");
 const contourMinArea = document.getElementById("contourMinArea");
 const contourMaxArea = document.getElementById("contourMaxArea");
 const symbolThresholdValue = document.getElementById("symbolThresholdValue");
 const motionThresholdValue = document.getElementById("motionThresholdValue");
+const motionDiffThresholdValue = document.getElementById("motionDiffThresholdValue");
+const settlementSecondsValue = document.getElementById("settlementSecondsValue");
 const contourMinAreaValue = document.getElementById("contourMinAreaValue");
 const contourMaxAreaValue = document.getElementById("contourMaxAreaValue");
 const symbolThresholdValueOut = document.getElementById("symbolThresholdValueOut");
@@ -36,6 +40,24 @@ const profileName = document.getElementById("profileName");
 const profileSelect = document.getElementById("profileSelect");
 const saveProfileButton = document.getElementById("saveProfileButton");
 const loadProfileButton = document.getElementById("loadProfileButton");
+const stillImageInput = document.getElementById("stillImageInput");
+const stillImageButton = document.getElementById("stillImageButton");
+const stillImageResult = document.getElementById("stillImageResult");
+const stillImagePreview = document.getElementById("stillImagePreview");
+const bridgeStatusPill = document.getElementById("bridgeStatusPill");
+const bridgeRequestId = document.getElementById("bridgeRequestId");
+const bridgeDiceCount = document.getElementById("bridgeDiceCount");
+const bridgeTimeoutSeconds = document.getElementById("bridgeTimeoutSeconds");
+const bridgeConnectButton = document.getElementById("bridgeConnectButton");
+const bridgeDisconnectButton = document.getElementById("bridgeDisconnectButton");
+const bridgeConnectMessageButton = document.getElementById("bridgeConnectMessageButton");
+const bridgePingButton = document.getElementById("bridgePingButton");
+const bridgeConfigButton = document.getElementById("bridgeConfigButton");
+const bridgeRollButton = document.getElementById("bridgeRollButton");
+const bridgeClearLogButton = document.getElementById("bridgeClearLogButton");
+const bridgeMessageInput = document.getElementById("bridgeMessageInput");
+const bridgeSendCustomButton = document.getElementById("bridgeSendCustomButton");
+const bridgeMessageLog = document.getElementById("bridgeMessageLog");
 
 const wizardSteps = [
   {
@@ -67,6 +89,7 @@ const wizardSteps = [
 let wizardStepIndex = 0;
 let currentRoi = null;
 let roiDragStart = null;
+let bridgeSocket = null;
 
 function updateStatusView(state) {
   const status = state.status || "ERROR";
@@ -229,6 +252,8 @@ function setRoiFields(roi) {
 
 function renderSliderValues() {
   motionThresholdValue.textContent = motionThreshold.value;
+  motionDiffThresholdValue.textContent = motionDiffThreshold.value;
+  settlementSecondsValue.textContent = `${Number(settlementSeconds.value).toFixed(1)}s`;
   contourMinAreaValue.textContent = contourMinArea.value;
   contourMaxAreaValue.textContent = contourMaxArea.value;
   symbolThresholdValueOut.textContent = symbolThresholdValue.value;
@@ -241,6 +266,8 @@ async function loadVisionConfig() {
   }
   const cfg = await response.json();
   motionThreshold.value = cfg.vision.motion_threshold;
+  motionDiffThreshold.value = cfg.vision.motion_diff_threshold || 30;
+  settlementSeconds.value = cfg.vision.settlement_seconds || 1.5;
   contourMinArea.value = cfg.vision.contour_min_area;
   contourMaxArea.value = cfg.vision.contour_max_area;
   symbolThresholdValue.value = cfg.vision.symbol_threshold_value;
@@ -261,6 +288,93 @@ function renderWizardStep() {
 function parseIntSafe(value, fallback) {
   const parsed = Number.parseInt(value, 10);
   return Number.isNaN(parsed) ? fallback : parsed;
+}
+
+function makeBridgeConfig() {
+  return {
+    expected_dice_count: Math.max(1, parseIntSafe(bridgeDiceCount.value, 3)),
+    timeout_seconds: Math.max(1, parseIntSafe(bridgeTimeoutSeconds.value, 30)),
+  };
+}
+
+function makeBridgeMessage(type) {
+  const requestId = bridgeRequestId.value.trim();
+  const base = { type };
+  if (requestId) {
+    base.request_id = requestId;
+  }
+  if (type === "connect") {
+    base.client_name = "troubleshooting-ui";
+  }
+  if (type === "config.update" || type === "roll.request") {
+    base.config = makeBridgeConfig();
+  }
+  if (type === "roll.request" && !base.request_id) {
+    base.request_id = crypto.randomUUID();
+    bridgeRequestId.value = base.request_id;
+  }
+  return base;
+}
+
+function setBridgeMessageTemplate(type) {
+  bridgeMessageInput.value = JSON.stringify(makeBridgeMessage(type), null, 2);
+}
+
+function setBridgeStatus(status) {
+  bridgeStatusPill.textContent = status;
+  bridgeStatusPill.className = status === "CONNECTED"
+    ? "statusPill status-WATCHING"
+    : "statusPill status-IDLE";
+}
+
+function appendBridgeLog(direction, payload) {
+  const timestamp = new Date().toISOString();
+  const body = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
+  bridgeMessageLog.textContent += `[${timestamp}] ${direction}\n${body}\n\n`;
+  bridgeMessageLog.scrollTop = bridgeMessageLog.scrollHeight;
+}
+
+function connectBridgeSocket() {
+  if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+    appendBridgeLog("info", "Already connected.");
+    return;
+  }
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  bridgeSocket = new WebSocket(`${protocol}//${window.location.host}/ws/game-bridge`);
+  setBridgeStatus("CONNECTING");
+
+  bridgeSocket.addEventListener("open", () => {
+    setBridgeStatus("CONNECTED");
+    appendBridgeLog("open", "/ws/game-bridge");
+  });
+  bridgeSocket.addEventListener("message", (event) => {
+    try {
+      appendBridgeLog("received", JSON.parse(event.data));
+    } catch {
+      appendBridgeLog("received", event.data);
+    }
+  });
+  bridgeSocket.addEventListener("close", () => {
+    setBridgeStatus("DISCONNECTED");
+    appendBridgeLog("close", "/ws/game-bridge");
+  });
+  bridgeSocket.addEventListener("error", () => {
+    appendBridgeLog("error", "WebSocket error.");
+  });
+}
+
+function sendBridgeJson(message) {
+  if (!bridgeSocket || bridgeSocket.readyState !== WebSocket.OPEN) {
+    throw new Error("connect the WebSocket first");
+  }
+  bridgeSocket.send(JSON.stringify(message));
+  appendBridgeLog("sent", message);
+}
+
+function sendBridgeTemplate(type) {
+  const message = makeBridgeMessage(type);
+  bridgeMessageInput.value = JSON.stringify(message, null, 2);
+  sendBridgeJson(message);
 }
 
 async function loadRoiConfig() {
@@ -330,6 +444,8 @@ async function pushCameraSelection() {
 async function pushVisionConfig() {
   const payload = {
     motion_threshold: Number(motionThreshold.value),
+    motion_diff_threshold: Number(motionDiffThreshold.value),
+    settlement_seconds: Number(settlementSeconds.value),
     contour_min_area: Number(contourMinArea.value),
     contour_max_area: Number(contourMaxArea.value),
     symbol_threshold_value: Number(symbolThresholdValue.value),
@@ -392,6 +508,34 @@ async function applySelectedProfile() {
   await loadVisionConfig();
   await loadRoiConfig();
   updateVideoStage(stageSelect.value || "raw");
+}
+
+async function analyzeStillImage() {
+  const file = stillImageInput.files[0];
+  if (!file) {
+    stillImageResult.textContent = "Choose an image file first.";
+    return;
+  }
+
+  stillImageButton.disabled = true;
+  stillImageResult.textContent = "Analyzing image...";
+  try {
+    const response = await fetch("/api/still_image_roll", {
+      method: "POST",
+      headers: { "Content-Type": file.type || "image/jpeg" },
+      body: file,
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.detail || `HTTP ${response.status}`);
+    }
+    stillImageResult.textContent = JSON.stringify(data, null, 2);
+    await fetchHistory();
+  } catch (error) {
+    stillImageResult.textContent = `Image analysis failed: ${error}`;
+  } finally {
+    stillImageButton.disabled = false;
+  }
 }
 
 fallbackButton.addEventListener("click", async () => {
@@ -512,7 +656,78 @@ loadProfileButton.addEventListener("click", async () => {
   }
 });
 
-[motionThreshold, contourMinArea, contourMaxArea, symbolThresholdValue].forEach((slider) => {
+stillImageInput.addEventListener("change", () => {
+  const file = stillImageInput.files[0];
+  if (!file) {
+    stillImagePreview.removeAttribute("src");
+    stillImagePreview.hidden = true;
+    stillImageResult.textContent = "";
+    return;
+  }
+  stillImagePreview.src = URL.createObjectURL(file);
+  stillImagePreview.hidden = false;
+  stillImageResult.textContent = "Image selected. Click Analyze Image.";
+});
+
+stillImageButton.addEventListener("click", () => {
+  analyzeStillImage();
+});
+
+bridgeConnectButton.addEventListener("click", () => {
+  connectBridgeSocket();
+});
+
+bridgeDisconnectButton.addEventListener("click", () => {
+  if (bridgeSocket) {
+    bridgeSocket.close();
+  }
+});
+
+bridgeConnectMessageButton.addEventListener("click", () => {
+  try {
+    sendBridgeTemplate("connect");
+  } catch (error) {
+    appendBridgeLog("error", String(error));
+  }
+});
+
+bridgePingButton.addEventListener("click", () => {
+  try {
+    sendBridgeTemplate("ping");
+  } catch (error) {
+    appendBridgeLog("error", String(error));
+  }
+});
+
+bridgeConfigButton.addEventListener("click", () => {
+  try {
+    sendBridgeTemplate("config.update");
+  } catch (error) {
+    appendBridgeLog("error", String(error));
+  }
+});
+
+bridgeRollButton.addEventListener("click", () => {
+  try {
+    sendBridgeTemplate("roll.request");
+  } catch (error) {
+    appendBridgeLog("error", String(error));
+  }
+});
+
+bridgeSendCustomButton.addEventListener("click", () => {
+  try {
+    sendBridgeJson(JSON.parse(bridgeMessageInput.value));
+  } catch (error) {
+    appendBridgeLog("error", String(error));
+  }
+});
+
+bridgeClearLogButton.addEventListener("click", () => {
+  bridgeMessageLog.textContent = "";
+});
+
+[motionThreshold, motionDiffThreshold, settlementSeconds, contourMinArea, contourMaxArea, symbolThresholdValue].forEach((slider) => {
   slider.addEventListener("input", async () => {
     renderSliderValues();
     try {
@@ -560,6 +775,8 @@ document.addEventListener("keydown", (event) => {
 });
 
 async function init() {
+  bridgeRequestId.value = crypto.randomUUID();
+  setBridgeMessageTemplate("roll.request");
   fetchStatus();
   fetchCalibrationQuality();
   fetchHistory();

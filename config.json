@@ -1,16 +1,18 @@
 {
-  "camera_index": 1,
+  "camera_index": 0,
   "roi": [
-    567,
-    125,
-    2,
-    1
+    0,
+    0,
+    2304,
+    1296
   ],
   "vision": {
-    "motion_threshold": 1200,
-    "contour_min_area": 500,
-    "contour_max_area": 30000,
-    "symbol_threshold_value": 122
+    "motion_threshold": 2000,
+    "motion_diff_threshold": 45,
+    "settlement_seconds": 1.0,
+    "contour_min_area": 650,
+    "contour_max_area": 28100,
+    "symbol_threshold_value": 211
   },
   "calibration_profiles": {}
 }

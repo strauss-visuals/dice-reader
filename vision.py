@@ -9,14 +9,14 @@ import numpy as np
 
 @dataclass
 class VisionConfig:
-    motion_threshold: int = 1200
-    motion_diff_threshold: int = 30
+    motion_threshold: int = 2000
+    motion_diff_threshold: int = 45
     motion_intensity_shift_threshold: float = 20.0
-    settlement_seconds: float = 1.5
+    settlement_seconds: float = 1.0
     processing_fps: float = 30.0
-    contour_min_area: int = 500
-    contour_max_area: int = 30000
-    symbol_threshold_value: int = 127
+    contour_min_area: int = 650
+    contour_max_area: int = 28100
+    symbol_threshold_value: int = 211
     blank_pixel_ratio_threshold: float = 0.03
     line_peak_threshold: float = 0.38
     minimum_confidence: float = 0.55
@@ -28,6 +28,8 @@ class VisionProcessor:
         self.config = config or VisionConfig()
         self.previous_gray: np.ndarray | None = None
         self.low_motion_frames = 0
+        self.low_motion_started_at: float | None = None
+        self.settlement_progress_seconds = 0.0
 
     @property
     def required_settlement_frames(self) -> int:
@@ -36,6 +38,8 @@ class VisionProcessor:
     def reset_motion_history(self) -> None:
         self.previous_gray = None
         self.low_motion_frames = 0
+        self.low_motion_started_at = None
+        self.settlement_progress_seconds = 0.0
 
     def _resolve_roi(self, frame: np.ndarray) -> tuple[int, int, int, int]:
         frame_h, frame_w = frame.shape[:2]
@@ -74,13 +78,31 @@ class VisionProcessor:
         self.previous_gray = gray
         return motion_pixels
 
-    def update_settlement(self, motion_pixels: int) -> bool:
+    def update_settlement(self, motion_pixels: int, now_seconds: float | None = None) -> bool:
+        if now_seconds is None:
+            now_seconds = cv2.getTickCount() / cv2.getTickFrequency()
+
+        motion_limit = self.config.motion_threshold
+        grace_limit = int(motion_limit * 1.35)
         if motion_pixels < self.config.motion_threshold:
             self.low_motion_frames += 1
+            if self.low_motion_started_at is None:
+                self.low_motion_started_at = now_seconds
+        elif motion_pixels < grace_limit and self.low_motion_started_at is not None:
+            # Camera noise and exposure shifts can cause one-frame spikes after
+            # the dice have stopped. Keep timing unless motion clearly resumes.
+            self.low_motion_frames = max(0, self.low_motion_frames - 1)
         else:
             self.low_motion_frames = 0
+            self.low_motion_started_at = None
 
-        return self.low_motion_frames >= self.required_settlement_frames
+        self.settlement_progress_seconds = (
+            max(0.0, now_seconds - self.low_motion_started_at)
+            if self.low_motion_started_at is not None
+            else 0.0
+        )
+
+        return self.settlement_progress_seconds >= self.config.settlement_seconds
 
     def find_dice_contours(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
         roi_x, roi_y, roi_w, roi_h = self._resolve_roi(frame)
@@ -171,6 +193,17 @@ class VisionProcessor:
 
         return results
 
+    def preprocess_still_image(self, frame: np.ndarray) -> np.ndarray:
+        # This is intentionally conservative for now. It proves the still-image
+        # path can run through OpenCV without changing recognition behavior yet.
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+    def calculate_roll_from_still_image(self, frame: np.ndarray) -> list[dict]:
+        preprocessed_frame = self.preprocess_still_image(frame)
+        return self.calculate_roll(preprocessed_frame)
+
     def motion_mask_from_pair(self, previous_frame: np.ndarray, current_frame: np.ndarray) -> np.ndarray:
         prev = cv2.cvtColor(previous_frame, cv2.COLOR_BGR2GRAY)
         prev = cv2.GaussianBlur(prev, (5, 5), 0)
@@ -187,6 +220,21 @@ class VisionProcessor:
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
         edges = cv2.Canny(blur, 50, 150)
         return edges
+
+    def contour_debug_view(self, frame: np.ndarray) -> np.ndarray:
+        display = frame.copy()
+        for x, y, w, h in self.find_dice_contours(frame):
+            cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 3)
+            cv2.putText(
+                display,
+                f"area {w * h}",
+                (x, max(20, y - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 0),
+                2,
+            )
+        return display
 
     def thresholded_view(self, frame: np.ndarray) -> np.ndarray:
         roi_x, roi_y, roi_w, roi_h = self._resolve_roi(frame)

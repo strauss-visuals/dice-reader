@@ -20,7 +20,7 @@ from typing import Literal
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -64,10 +64,18 @@ class SystemState(BaseModel):
     active_dice_count: int = 0
 
 
-class GameCommand(BaseModel):
-    action: str
+class BridgeCommand(BaseModel):
+    type: str | None = None
+    action: str | None = None
     request_id: str | None = None
+    client_name: str | None = Field(default=None, max_length=80)
     config: RollConfig | None = None
+
+
+class BridgeErrorPayload(BaseModel):
+    reason: str
+    message: str | None = None
+    active_request_id: str | None = None
 
 
 class RuntimeState(BaseModel):
@@ -76,10 +84,12 @@ class RuntimeState(BaseModel):
 
 
 class VisionTuningConfig(BaseModel):
-    motion_threshold: int = Field(default=1200, ge=1)
-    contour_min_area: int = Field(default=500, ge=1)
-    contour_max_area: int = Field(default=30000, ge=1)
-    symbol_threshold_value: int = Field(default=127, ge=0, le=255)
+    motion_threshold: int = Field(default=2000, ge=1)
+    motion_diff_threshold: int = Field(default=45, ge=1, le=255)
+    settlement_seconds: float = Field(default=1.0, ge=0.2, le=10.0)
+    contour_min_area: int = Field(default=650, ge=1)
+    contour_max_area: int = Field(default=28100, ge=1)
+    symbol_threshold_value: int = Field(default=211, ge=0, le=255)
 
 
 class CalibrationProfile(BaseModel):
@@ -139,6 +149,8 @@ app_config = AppConfig()
 vision = VisionProcessor(
     VisionConfig(
         motion_threshold=app_config.vision.motion_threshold,
+        motion_diff_threshold=app_config.vision.motion_diff_threshold,
+        settlement_seconds=app_config.vision.settlement_seconds,
         contour_min_area=app_config.vision.contour_min_area,
         contour_max_area=app_config.vision.contour_max_area,
         symbol_threshold_value=app_config.vision.symbol_threshold_value,
@@ -293,6 +305,8 @@ def apply_config_to_runtime() -> None:
     global camera_index
     camera_index = app_config.camera_index
     vision.config.motion_threshold = app_config.vision.motion_threshold
+    vision.config.motion_diff_threshold = app_config.vision.motion_diff_threshold
+    vision.config.settlement_seconds = app_config.vision.settlement_seconds
     vision.config.contour_min_area = app_config.vision.contour_min_area
     vision.config.contour_max_area = app_config.vision.contour_max_area
     vision.config.symbol_threshold_value = app_config.vision.symbol_threshold_value
@@ -330,7 +344,7 @@ def draw_debug_overlay(frame):
 
     cv2.putText(
         frame,
-        f"State: {runtime_state.system.status} | Motion: {motion_value}",
+        f"State: {runtime_state.system.status} | Motion: {motion_value} | Stable: {vision.settlement_progress_seconds:.1f}/{vision.config.settlement_seconds:.1f}s",
         (10, 28),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.75,
@@ -365,12 +379,50 @@ async def broadcast_event(event_name: str, payload: dict, request_id: str | None
         return
 
     try:
-        message = {"event": event_name, "data": payload}
+        message_type = {
+            "PING": "heartbeat",
+            "ROLL_ACK": "roll.ack",
+            "ROLL_COMPLETE": "roll.result",
+            "ROLL_ERROR": "error",
+        }.get(event_name, event_name.lower())
+        message = {"type": message_type, "event": event_name, "data": payload}
         if request_id is not None:
             message["request_id"] = request_id
         await game_bridge_socket.send_json(message)
     except Exception as error:  # pragma: no cover - best effort socket send
         log_event(logging.WARNING, f"Broadcast failed for {event_name}: {error}", request_id=request_id)
+
+
+async def send_bridge_message(
+    websocket: WebSocket,
+    message_type: str,
+    payload: dict,
+    request_id: str | None = None,
+    event_name: str | None = None,
+) -> None:
+    message = {"type": message_type, "data": payload}
+    if event_name is not None:
+        message["event"] = event_name
+    if request_id is not None:
+        message["request_id"] = request_id
+    await websocket.send_json(message)
+
+
+async def send_bridge_error(
+    websocket: WebSocket,
+    reason: str,
+    request_id: str | None = None,
+    message: str | None = None,
+    active_id: str | None = None,
+) -> None:
+    payload = BridgeErrorPayload(reason=reason, message=message, active_request_id=active_id)
+    await send_bridge_message(
+        websocket,
+        "error",
+        payload.model_dump(exclude_none=True),
+        request_id=request_id,
+        event_name="ROLL_ERROR",
+    )
 
 
 async def heartbeat_loop(interval_seconds: int = 10) -> None:
@@ -434,6 +486,34 @@ def generate_fallback_roll(expected_dice_count: int) -> RollPayload:
     return RollPayload(total_score=total_score, dice=dice, is_fallback=True)
 
 
+def decode_image_bytes(image_bytes: bytes):
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded image is empty.")
+
+    encoded = np.frombuffer(image_bytes, dtype=np.uint8)
+    frame = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Uploaded file is not a readable image.")
+    return frame
+
+
+def build_roll_payload_from_dice(parsed_results: list[dict]) -> RollPayload:
+    dice = [DieResult.model_validate(item) for item in parsed_results]
+    symbol_to_score = {"+": 1, "-": -1, "blank": 0}
+    total_score = sum(symbol_to_score[die.value] for die in dice)
+    roll_confidence = None
+    if dice:
+        roll_confidence = round(sum(die.confidence for die in dice) / len(dice), 3)
+
+    return RollPayload(
+        total_score=total_score,
+        dice=dice,
+        is_fallback=False,
+        roll_confidence=roll_confidence,
+        fallback_reason=None,
+    )
+
+
 async def reset_to_idle_after_delay(delay_seconds: float) -> None:
     await asyncio.sleep(delay_seconds)
     if runtime_state.system.status == "ERROR":
@@ -491,18 +571,7 @@ def process_settled_frame(frame) -> None:
         vision.reset_motion_history()
         return
 
-    dice = [DieResult.model_validate(item) for item in parsed_results]
-    symbol_to_score = {"+": 1, "-": -1, "blank": 0}
-    total_score = sum(symbol_to_score[die.value] for die in dice)
-
-    roll_confidence = round(sum(die.confidence for die in dice) / max(1, len(dice)), 3)
-    payload = RollPayload(
-        total_score=total_score,
-        dice=dice,
-        is_fallback=False,
-        roll_confidence=roll_confidence,
-        fallback_reason=None,
-    )
+    payload = build_roll_payload_from_dice(parsed_results)
     schedule_coroutine(broadcast_event("ROLL_COMPLETE", payload.model_dump(), request_id=active_request_id))
     snapshot_bytes = None
     ok, encoded = cv2.imencode(".jpg", draw_debug_overlay(frame.copy()))
@@ -565,7 +634,7 @@ def camera_worker_loop() -> None:
         if runtime_state.system.status == "WATCHING":
             motion_pixels = vision.detect_motion(frame)
             update_debug_overlay(motion_pixels=motion_pixels)
-            has_settled = vision.update_settlement(motion_pixels)
+            has_settled = vision.update_settlement(motion_pixels, time.monotonic())
             if has_settled:
                 process_settled_frame(frame)
         else:
@@ -686,7 +755,7 @@ def status_frame_bytes(message: str) -> bytes:
     return encoded.tobytes() if success else b""
 
 
-def mjpeg_frame_generator(stage: Literal["raw", "motion_mask", "edges", "thresholded"]):
+def mjpeg_frame_generator(stage: Literal["raw", "motion_mask", "edges", "contours", "thresholded"]):
     previous_raw = None
     while True:
         with latest_frame_lock:
@@ -729,6 +798,8 @@ def mjpeg_frame_generator(stage: Literal["raw", "motion_mask", "edges", "thresho
                 display[roi_y : roi_y + roi_h, roi_x : roi_x + roi_w] = edges_bgr
             else:
                 display = edges_bgr
+        elif stage == "contours":
+            display = vision.contour_debug_view(raw)
         elif stage == "thresholded":
             thresholded = vision.thresholded_view(raw)
             thresholded_bgr = cv2.cvtColor(thresholded, cv2.COLOR_GRAY2BGR)
@@ -862,6 +933,25 @@ async def get_history_snapshot(snapshot_id: str) -> StreamingResponse:
     return StreamingResponse(io.BytesIO(snapshot), media_type="image/jpeg")
 
 
+@app.post("/api/still_image_roll", response_model=RollPayload)
+async def still_image_roll(request: Request) -> RollPayload:
+    content_type = request.headers.get("content-type", "")
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=415, detail="Upload one image file.")
+
+    frame = decode_image_bytes(await request.body())
+    parsed_results = vision.calculate_roll_from_still_image(frame)
+    payload = build_roll_payload_from_dice(parsed_results)
+
+    snapshot_bytes = None
+    ok, encoded = cv2.imencode(".jpg", draw_debug_overlay(frame.copy()))
+    if ok:
+        snapshot_bytes = encoded.tobytes()
+    append_history(payload, request_id="still-image-upload", snapshot_bytes=snapshot_bytes)
+    log_event(logging.INFO, f"Still image roll complete with score={payload.total_score}")
+    return payload
+
+
 @app.get("/api/export_diagnostics")
 async def export_diagnostics() -> StreamingResponse:
     snapshot = {
@@ -910,7 +1000,7 @@ async def update_vision_config(updated: VisionTuningConfig) -> VisionTuningConfi
 
 @app.get("/video_feed")
 async def video_feed(
-    stage: Literal["raw", "motion_mask", "edges", "thresholded"] = Query(default="raw"),
+    stage: Literal["raw", "motion_mask", "edges", "contours", "thresholded"] = Query(default="raw"),
 ) -> StreamingResponse:
     return StreamingResponse(
         mjpeg_frame_generator(stage),
@@ -957,45 +1047,89 @@ async def game_bridge(websocket: WebSocket) -> None:
     cancel_task(heartbeat_task)
     heartbeat_task = asyncio.create_task(heartbeat_loop())
     log_event(logging.INFO, f"Game bridge connected: {websocket.client}")
+    await send_bridge_message(
+        websocket,
+        "connect.ok",
+        {
+            "protocol_version": 1,
+            "message_types": [
+                "connect",
+                "ping",
+                "pong",
+                "config.update",
+                "roll.request",
+                "roll.ack",
+                "roll.result",
+                "heartbeat",
+                "error",
+            ],
+            "status": runtime_state.system.status,
+            "expected_dice_count": runtime_state.expected_dice_count,
+        },
+    )
 
     try:
         while True:
             message = await websocket.receive_text()
             try:
-                parsed = GameCommand.model_validate(json.loads(message))
+                parsed = BridgeCommand.model_validate(json.loads(message))
                 log_event(logging.INFO, "Message received on /ws/game-bridge", request_id=parsed.request_id)
             except (json.JSONDecodeError, ValueError) as error:
                 log_event(logging.WARNING, f"Invalid game command: {error}")
-                await websocket.send_json({"event": "ROLL_ERROR", "data": {"reason": "INVALID_COMMAND_PAYLOAD"}})
+                await send_bridge_error(websocket, "INVALID_COMMAND_PAYLOAD", message=str(error))
                 continue
 
-            if parsed.action == "REQUEST_ROLL":
+            message_type = parsed.type or parsed.action
+            legacy_action_map = {
+                "REQUEST_ROLL": "roll.request",
+                "PING": "ping",
+                "PONG": "pong",
+            }
+            message_type = legacy_action_map.get(message_type or "", message_type)
+
+            if message_type == "connect":
+                last_heartbeat_ts = time.time()
+                await send_bridge_message(
+                    websocket,
+                    "connect.ok",
+                    {
+                        "protocol_version": 1,
+                        "client_name": parsed.client_name,
+                        "status": runtime_state.system.status,
+                        "expected_dice_count": runtime_state.expected_dice_count,
+                    },
+                    request_id=parsed.request_id,
+                )
+            elif message_type == "config.update":
+                config = parsed.config or RollConfig()
+                runtime_state.expected_dice_count = config.expected_dice_count
+                await send_bridge_message(
+                    websocket,
+                    "config.updated",
+                    {
+                        "expected_dice_count": config.expected_dice_count,
+                        "timeout_seconds": config.timeout_seconds,
+                    },
+                    request_id=parsed.request_id,
+                )
+            elif message_type == "roll.request":
                 if not parsed.request_id:
-                    await websocket.send_json(
-                        {
-                            "event": "ROLL_ERROR",
-                            "request_id": None,
-                            "data": {"reason": "MISSING_REQUEST_ID"},
-                        }
-                    )
+                    await send_bridge_error(websocket, "MISSING_REQUEST_ID")
                     continue
 
                 if runtime_state.system.status in {"WATCHING", "CALCULATING"}:
                     # Safer behavior: reject overlap and preserve deterministic handling of the active request.
-                    await websocket.send_json(
-                        {
-                            "event": "ROLL_ERROR",
-                            "request_id": parsed.request_id,
-                            "data": {
-                                "reason": "REQUEST_REJECTED_BUSY",
-                                "active_request_id": active_request_id,
-                            },
-                        }
+                    await send_bridge_error(
+                        websocket,
+                        "REQUEST_REJECTED_BUSY",
+                        request_id=parsed.request_id,
+                        active_id=active_request_id,
                     )
                     continue
 
-                requested_count = parsed.config.expected_dice_count if parsed.config else 3
-                timeout_seconds = parsed.config.timeout_seconds if parsed.config else 30
+                config = parsed.config or RollConfig(expected_dice_count=runtime_state.expected_dice_count)
+                requested_count = config.expected_dice_count
+                timeout_seconds = config.timeout_seconds
                 active_request_id = parsed.request_id
                 runtime_state.expected_dice_count = requested_count
 
@@ -1013,30 +1147,34 @@ async def game_bridge(websocket: WebSocket) -> None:
                 vision.reset_motion_history()
                 watch_timeout_task = asyncio.create_task(handle_roll_timeout(timeout_seconds))
 
-                await websocket.send_json(
+                await send_bridge_message(
+                    websocket,
+                    "roll.ack",
                     {
-                        "event": "ROLL_ACK",
-                        "request_id": parsed.request_id,
-                        "data": {
-                            "status": runtime_state.system.status,
-                            "message": runtime_state.system.message,
-                            "expected_dice_count": requested_count,
-                            "timeout_seconds": timeout_seconds,
-                        },
-                    }
+                        "status": runtime_state.system.status,
+                        "message": runtime_state.system.message,
+                        "expected_dice_count": requested_count,
+                        "timeout_seconds": timeout_seconds,
+                    },
+                    request_id=parsed.request_id,
+                    event_name="ROLL_ACK",
                 )
-            elif parsed.action == "PING":
+            elif message_type == "ping":
                 last_heartbeat_ts = time.time()
-                await websocket.send_json({"event": "PONG", "data": {"ts": int(time.time())}})
-            elif parsed.action == "PONG":
+                await send_bridge_message(
+                    websocket,
+                    "pong",
+                    {"ts": int(time.time())},
+                    request_id=parsed.request_id,
+                    event_name="PONG",
+                )
+            elif message_type == "pong":
                 last_heartbeat_ts = time.time()
             else:
-                await websocket.send_json(
-                    {
-                        "event": "ROLL_ERROR",
-                        "request_id": parsed.request_id,
-                        "data": {"reason": f"UNSUPPORTED_ACTION_{parsed.action}"},
-                    }
+                await send_bridge_error(
+                    websocket,
+                    f"UNSUPPORTED_MESSAGE_TYPE_{message_type}",
+                    request_id=parsed.request_id,
                 )
     except WebSocketDisconnect:
         cancel_task(heartbeat_task)
