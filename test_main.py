@@ -245,6 +245,47 @@ def test_settlement_resets_when_motion_resumes() -> None:
     assert processor.update_settlement(10, now_seconds=2.2) is True
 
 
+def test_symbol_classifier_reads_centered_fate_faces() -> None:
+    processor = main.VisionProcessor(
+        main.VisionConfig(
+            symbol_threshold_value=180,
+            blank_pixel_ratio_threshold=0.03,
+        )
+    )
+
+    minus_crop = np.full((100, 100, 3), 235, dtype=np.uint8)
+    cv2.line(minus_crop, (25, 50), (75, 50), (20, 20, 20), 8)
+    assert processor.classify_symbol(minus_crop)[0] == "-"
+
+    plus_crop = np.full((100, 100, 3), 235, dtype=np.uint8)
+    cv2.line(plus_crop, (25, 50), (75, 50), (20, 20, 20), 8)
+    cv2.line(plus_crop, (50, 25), (50, 75), (20, 20, 20), 8)
+    assert processor.classify_symbol(plus_crop)[0] == "+"
+
+    blank_crop = np.full((100, 100, 3), 235, dtype=np.uint8)
+    assert processor.classify_symbol(blank_crop)[0] == "blank"
+
+
+def test_blank_die_body_detects_as_full_square() -> None:
+    processor = main.VisionProcessor(
+        main.VisionConfig(
+            contour_min_area=1000,
+            contour_max_area=20000,
+        )
+    )
+    frame = np.full((180, 180, 3), 35, dtype=np.uint8)
+    cv2.rectangle(frame, (50, 45), (130, 125), (220, 35, 180), -1)
+
+    boxes = processor.find_dice_contours(frame)
+
+    assert len(boxes) == 1
+    x, y, w, h = boxes[0]
+    assert x <= 55
+    assert y <= 50
+    assert w >= 70
+    assert h >= 70
+
+
 def test_reconnect_camera_releases_old_capture_and_reopens_configured_device(monkeypatch) -> None:
     class FakeCapture:
         def __init__(self) -> None:
