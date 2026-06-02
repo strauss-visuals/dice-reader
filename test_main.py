@@ -31,7 +31,11 @@ def isolated_config_file(tmp_path, monkeypatch):
     temporary_config = tmp_path / "config.json"
     temporary_config.write_text(json.dumps(original_config.model_dump()), encoding="utf-8")
     monkeypatch.setattr(main, "config_path", temporary_config)
-    monkeypatch.setattr(main, "open_camera_device", lambda index: FakeCapture() if index == 0 else None)
+    monkeypatch.setattr(
+        main,
+        "open_camera_device",
+        lambda index, require_signal=True: FakeCapture() if index == 0 else None,
+    )
     main.runtime_state.expected_dice_count = 3
     main.history.clear()
     main.roll_snapshots.clear()
@@ -84,11 +88,11 @@ def test_cameras_endpoint_returns_probe_list() -> None:
     with TestClient(main.app) as client:
         response = client.get("/api/cameras")
         assert response.status_code == 200
-        payload = response.json()
-        assert isinstance(payload, list)
-        assert len(payload) == 5
-        for item in payload:
-            assert set(item.keys()) == {"index", "available"}
+    payload = response.json()
+    assert isinstance(payload, list)
+    assert len(payload) == 5
+    for item in payload:
+        assert set(item.keys()) == {"index", "available", "has_signal", "mean_intensity", "contrast"}
 
 
 def test_camera_update_rejects_unavailable_index() -> None:
@@ -266,6 +270,46 @@ def test_symbol_classifier_reads_centered_fate_faces() -> None:
     assert processor.classify_symbol(blank_crop)[0] == "blank"
 
 
+def test_symbol_classifier_supports_colored_dice_with_light_and_dark_symbols() -> None:
+    processor = main.VisionProcessor(
+        main.VisionConfig(
+            symbol_threshold_value=180,
+            blank_pixel_ratio_threshold=0.03,
+        )
+    )
+
+    blue_blank = np.full((120, 120, 3), (180, 70, 20), dtype=np.uint8)
+    assert processor.classify_symbol(blue_blank)[0] == "blank"
+
+    orange_blank = np.full((120, 120, 3), (20, 120, 235), dtype=np.uint8)
+    orange_value, orange_confidence = processor.classify_symbol(orange_blank)
+    assert orange_value == "blank"
+    assert orange_confidence >= 0.70
+
+    pink_blank = np.full((120, 120, 3), (190, 40, 235), dtype=np.uint8)
+    pink_value, pink_confidence = processor.classify_symbol(pink_blank)
+    assert pink_value == "blank"
+    assert pink_confidence >= 0.70
+
+    teal_plus = np.full((120, 120, 3), (110, 75, 20), dtype=np.uint8)
+    cv2.line(teal_plus, (35, 60), (85, 60), (80, 220, 240), 9)
+    cv2.line(teal_plus, (60, 35), (60, 85), (80, 220, 240), 9)
+    assert processor.classify_symbol(teal_plus)[0] == "+"
+
+    pink_minus = np.full((120, 120, 3), (190, 40, 235), dtype=np.uint8)
+    cv2.line(pink_minus, (35, 60), (85, 60), (245, 245, 245), 9)
+    assert processor.classify_symbol(pink_minus)[0] == "-"
+
+    small_purple_minus = np.full((80, 80, 3), (80, 45, 55), dtype=np.uint8)
+    cv2.line(small_purple_minus, (32, 40), (48, 38), (30, 150, 215), 4)
+    assert processor.classify_symbol(small_purple_minus)[0] == "-"
+
+    white_plus = np.full((120, 120, 3), 235, dtype=np.uint8)
+    cv2.line(white_plus, (35, 60), (85, 60), (20, 20, 20), 9)
+    cv2.line(white_plus, (60, 35), (60, 85), (20, 20, 20), 9)
+    assert processor.classify_symbol(white_plus)[0] == "+"
+
+
 def test_blank_die_body_detects_as_full_square() -> None:
     processor = main.VisionProcessor(
         main.VisionConfig(
@@ -298,7 +342,7 @@ def test_reconnect_camera_releases_old_capture_and_reopens_configured_device(mon
     replacement = FakeCapture()
     monkeypatch.setattr(main, "cap", old_capture)
     monkeypatch.setattr(main, "camera_index", 2)
-    monkeypatch.setattr(main, "open_camera_device", lambda index: replacement if index == 2 else None)
+    monkeypatch.setattr(main, "open_camera_device", lambda index, require_signal=True: replacement if index == 2 else None)
 
     assert main.reconnect_camera() is True
     assert old_capture.released is True

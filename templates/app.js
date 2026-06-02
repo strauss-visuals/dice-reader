@@ -5,9 +5,14 @@ const statusReason = document.getElementById("statusReason");
 const qualityPill = document.getElementById("qualityPill");
 const qualityScore = document.getElementById("qualityScore");
 const qualityMessage = document.getElementById("qualityMessage");
+const analyzeSuitabilityButton = document.getElementById("analyzeSuitabilityButton");
+const suitabilityBody = document.getElementById("suitabilityBody");
 const videoFeed = document.getElementById("videoFeed");
 const roiCanvas = document.getElementById("roiCanvas");
 const cameraSelect = document.getElementById("cameraSelect");
+const ndiSourceSelect = document.getElementById("ndiSourceSelect");
+const refreshNdiButton = document.getElementById("refreshNdiButton");
+const useNdiButton = document.getElementById("useNdiButton");
 const stageSelect = document.getElementById("stageSelect");
 const motionThreshold = document.getElementById("motionThreshold");
 const motionDiffThreshold = document.getElementById("motionDiffThreshold");
@@ -182,6 +187,38 @@ function closeSnapshotModal() {
   snapshotModal.classList.remove("open");
   snapshotModal.setAttribute("aria-hidden", "true");
   snapshotModalImage.removeAttribute("src");
+}
+
+function renderSuitabilityReport(report) {
+  if (!report.items.length) {
+    suitabilityBody.innerHTML = "<tr><td colspan=\"6\">No dice detected.</td></tr>";
+    return;
+  }
+
+  suitabilityBody.innerHTML = report.items
+    .map((item) => {
+      return `
+        <tr>
+          <td>${item.index}</td>
+          <td>${item.value}</td>
+          <td>${Number(item.confidence).toFixed(2)}</td>
+          <td>${item.color_label}</td>
+          <td>${item.status}</td>
+          <td>${item.reason}</td>
+        </tr>
+      `;
+    })
+    .join("");
+}
+
+async function fetchDiceSuitability() {
+  const response = await fetch("/api/dice_suitability");
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  const report = await response.json();
+  renderSuitabilityReport(report);
+  return report;
 }
 
 function openSnapshotModal(snapshotId) {
@@ -413,7 +450,12 @@ function renderCameraOptions(cameras, activeIndex) {
   cameraSelect.innerHTML = cameras
     .map((camera) => {
       const selected = camera.index === activeIndex ? "selected" : "";
-      const stateLabel = camera.available ? "available" : "unavailable";
+      let stateLabel = "unavailable";
+      if (camera.available && camera.has_signal) {
+        stateLabel = "signal";
+      } else if (camera.available) {
+        stateLabel = "no signal";
+      }
       return `<option value="${camera.index}" ${selected}>Camera ${camera.index} (${stateLabel})</option>`;
     })
     .join("");
@@ -428,12 +470,50 @@ async function loadCameraOptions(activeIndex) {
   renderCameraOptions(cameras, activeIndex);
 }
 
+function renderNdiSources(sources, activeName) {
+  if (!sources.length) {
+    ndiSourceSelect.innerHTML = "<option value=\"\">No NDI sources found</option>";
+    return;
+  }
+
+  ndiSourceSelect.innerHTML = sources
+    .map((source) => {
+      const selected = source.name === activeName ? "selected" : "";
+      return `<option value="${source.name}" ${selected}>${source.name}</option>`;
+    })
+    .join("");
+}
+
+async function loadNdiSources(activeName = null) {
+  const response = await fetch("/api/ndi/sources");
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  const sources = await response.json();
+  renderNdiSources(sources, activeName);
+}
+
 async function pushCameraSelection() {
   const payload = { camera_index: Number(cameraSelect.value) };
   const response = await fetch("/api/camera", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+async function pushNdiSelection() {
+  if (!ndiSourceSelect.value) {
+    throw new Error("Choose an NDI source first.");
+  }
+  const response = await fetch("/api/ndi/source", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source_name: ndiSourceSelect.value }),
   });
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}`);
@@ -627,6 +707,28 @@ cameraSelect.addEventListener("change", async () => {
   }
 });
 
+refreshNdiButton.addEventListener("click", async () => {
+  result.textContent = "Scanning NDI sources...";
+  try {
+    await loadNdiSources();
+    result.textContent = "NDI scan complete.";
+  } catch (error) {
+    result.textContent = `NDI scan failed: ${error}`;
+  }
+});
+
+useNdiButton.addEventListener("click", async () => {
+  result.textContent = "Switching to NDI source...";
+  try {
+    const cfg = await pushNdiSelection();
+    updateVideoStage(stageSelect.value || "raw");
+    await fetchStatus();
+    result.textContent = `NDI source selected: ${cfg.ndi_source_name}`;
+  } catch (error) {
+    result.textContent = `NDI switch failed: ${error}`;
+  }
+});
+
 saveRoiButton.addEventListener("click", async () => {
   result.textContent = "Saving ROI...";
   try {
@@ -742,6 +844,16 @@ exportDiagnosticsButton.addEventListener("click", () => {
   window.location.href = "/api/export_diagnostics";
 });
 
+analyzeSuitabilityButton.addEventListener("click", async () => {
+  result.textContent = "Analyzing dice suitability...";
+  try {
+    const report = await fetchDiceSuitability();
+    result.textContent = `Dice suitability analyzed: ${report.dice_count} detected.`;
+  } catch (error) {
+    result.textContent = `Dice suitability failed: ${error}`;
+  }
+});
+
 historyBody.addEventListener("click", (event) => {
   const target = event.target;
   if (!(target instanceof HTMLElement)) {
@@ -794,6 +906,9 @@ async function init() {
   if (cfg) {
     loadCameraOptions(cfg.camera_index).catch((error) => {
       result.textContent = `Camera scan failed: ${error}`;
+    });
+    loadNdiSources(cfg.ndi_source_name).catch((error) => {
+      result.textContent = `NDI scan failed: ${error}`;
     });
   }
 }

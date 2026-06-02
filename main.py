@@ -26,6 +26,11 @@ from pydantic import BaseModel, Field
 
 from vision import VisionConfig, VisionProcessor
 
+try:
+    import NDIlib as ndi
+except ImportError:
+    ndi = None
+
 logger = logging.getLogger("dice_reader")
 logger.setLevel(logging.INFO)
 logger.propagate = False
@@ -99,6 +104,9 @@ class CalibrationProfile(BaseModel):
 
 class AppConfig(BaseModel):
     camera_index: int = Field(default=0, ge=0)
+    camera_source_type: Literal["opencv", "ndi"] = "opencv"
+    ndi_source_name: str | None = None
+    force_no_signal_camera: bool = False
     roi: list[int] | None = Field(default=None, min_length=4, max_length=4)
     vision: VisionTuningConfig = Field(default_factory=VisionTuningConfig)
     calibration_profiles: dict[str, CalibrationProfile] = Field(default_factory=dict)
@@ -107,10 +115,23 @@ class AppConfig(BaseModel):
 class CameraOption(BaseModel):
     index: int
     available: bool
+    has_signal: bool = False
+    mean_intensity: float | None = None
+    contrast: float | None = None
 
 
 class CameraSelectRequest(BaseModel):
     camera_index: int = Field(ge=0)
+    force_no_signal: bool = False
+
+
+class NdiSourceOption(BaseModel):
+    name: str
+    url_address: str | None = None
+
+
+class NdiSourceSelectRequest(BaseModel):
+    source_name: str = Field(min_length=1)
 
 
 class CalibrationProfileRequest(BaseModel):
@@ -141,6 +162,23 @@ class RollHistoryItem(BaseModel):
     snapshot_id: str | None = None
 
 
+class DiceSuitabilityItem(BaseModel):
+    index: int
+    value: Literal["+", "-", "blank"]
+    confidence: float = Field(ge=0.0, le=1.0)
+    bbox: list[int] = Field(min_length=4, max_length=4)
+    color_label: str
+    status: Literal["PASS", "CHECK", "REMOVE"]
+    reason: str
+
+
+class DiceSuitabilityReport(BaseModel):
+    ok: bool
+    generated_at: str
+    dice_count: int
+    items: list[DiceSuitabilityItem]
+
+
 runtime_state = RuntimeState(
     system=SystemState(status="IDLE", message="Waiting for roll request", active_dice_count=0),
     expected_dice_count=3,
@@ -166,6 +204,7 @@ active_request_id: str | None = None
 last_heartbeat_ts: float = 0.0
 
 cap: cv2.VideoCapture | None = None
+ndi_receiver: "NdiReceiver | None" = None
 camera_lock = threading.Lock()
 camera_index = 0
 camera_cleanup_done = False
@@ -310,7 +349,94 @@ def apply_config_to_runtime() -> None:
     vision.config.contour_min_area = app_config.vision.contour_min_area
     vision.config.contour_max_area = app_config.vision.contour_max_area
     vision.config.symbol_threshold_value = app_config.vision.symbol_threshold_value
-    vision.config.roi = tuple(app_config.roi) if app_config.roi else None
+    if app_config.roi and app_config.roi[2] >= 50 and app_config.roi[3] >= 50:
+        vision.config.roi = tuple(app_config.roi)
+    else:
+        vision.config.roi = None
+
+
+class NdiReceiver:
+    def __init__(self, source_name: str) -> None:
+        if ndi is None:
+            raise RuntimeError("NDI Python binding is not installed.")
+        if not ndi.initialize():
+            raise RuntimeError("NDI runtime failed to initialize.")
+
+        source = self._find_source(source_name)
+        if source is None:
+            raise RuntimeError(f"NDI source '{source_name}' was not found.")
+
+        settings = ndi.RecvCreateV3()
+        settings.source_to_connect_to = source
+        settings.color_format = ndi.RECV_COLOR_FORMAT_BGRX_BGRA
+        settings.bandwidth = ndi.RECV_BANDWIDTH_HIGHEST
+        settings.allow_video_fields = False
+        self.receiver = ndi.recv_create_v3(settings)
+        if self.receiver is None:
+            raise RuntimeError(f"Could not create NDI receiver for '{source_name}'.")
+        self.source_name = source_name
+
+    @staticmethod
+    def _find_source(source_name: str):
+        finder = ndi.find_create_v2()
+        if finder is None:
+            return None
+        try:
+            ndi.find_wait_for_sources(finder, 2000)
+            for source in ndi.find_get_current_sources(finder) or []:
+                if source.ndi_name == source_name:
+                    return source
+        finally:
+            ndi.find_destroy(finder)
+        return None
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        frame_type, video_frame, _audio_frame, _metadata_frame = ndi.recv_capture_v2(
+            self.receiver,
+            1000,
+            True,
+            False,
+            False,
+        )
+        if frame_type != ndi.FRAME_TYPE_VIDEO:
+            return False, None
+
+        try:
+            frame_data = np.asarray(video_frame.data, dtype=np.uint8)
+            if frame_data.size == 0 or video_frame.xres <= 0 or video_frame.yres <= 0:
+                return False, None
+
+            row_stride = int(video_frame.line_stride_in_bytes)
+            width_bytes = int(video_frame.xres) * 4
+            if frame_data.ndim == 1:
+                bgra = frame_data.reshape((int(video_frame.yres), row_stride))[:, :width_bytes]
+                bgra = bgra.reshape((int(video_frame.yres), int(video_frame.xres), 4))
+            else:
+                bgra = frame_data.reshape((int(video_frame.yres), int(video_frame.xres), 4))
+            return True, cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
+        finally:
+            ndi.recv_free_video_v2(self.receiver, video_frame)
+
+    def release(self) -> None:
+        if self.receiver is not None:
+            ndi.recv_destroy(self.receiver)
+            self.receiver = None
+
+
+def list_ndi_sources(timeout_ms: int = 2000) -> list[NdiSourceOption]:
+    if ndi is None or not ndi.initialize():
+        return []
+    finder = ndi.find_create_v2()
+    if finder is None:
+        return []
+    try:
+        ndi.find_wait_for_sources(finder, timeout_ms)
+        return [
+            NdiSourceOption(name=source.ndi_name, url_address=source.url_address or None)
+            for source in (ndi.find_get_current_sources(finder) or [])
+        ]
+    finally:
+        ndi.find_destroy(finder)
 
 
 def load_or_create_config() -> None:
@@ -372,6 +498,104 @@ def draw_debug_overlay(frame):
         cv2.putText(frame, label, (x, max(20, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
     return frame
+
+
+def estimate_die_color(frame: np.ndarray, bbox: list[int]) -> str:
+    x, y, w, h = bbox
+    crop = frame[y : y + h, x : x + w]
+    if crop.size == 0:
+        return "unknown"
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hue = float(np.median(hsv[:, :, 0]))
+    saturation = float(np.median(hsv[:, :, 1]))
+    value = float(np.median(hsv[:, :, 2]))
+    if value < 45:
+        return "black"
+    if saturation < 45:
+        return "white/gray"
+    if hue < 10 or hue >= 170:
+        return "red/pink"
+    if hue < 25:
+        return "orange"
+    if hue < 40:
+        return "yellow/gold"
+    if hue < 85:
+        return "green"
+    if hue < 130:
+        return "blue/teal"
+    return "purple"
+
+
+def estimate_die_color_strength(frame: np.ndarray, bbox: list[int]) -> float:
+    x, y, w, h = bbox
+    crop = frame[y : y + h, x : x + w]
+    if crop.size == 0 or w <= 0 or h <= 0:
+        return 0.0
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    saturated_visible = cv2.bitwise_and(cv2.inRange(saturation, 90, 255), cv2.inRange(value, 45, 255))
+    return float(cv2.countNonZero(saturated_visible)) / float(w * h)
+
+
+def build_suitability_report(frame: np.ndarray) -> DiceSuitabilityReport:
+    results = vision.calculate_roll(frame)
+    areas = [item["bbox"][2] * item["bbox"][3] for item in results]
+    median_area = float(np.median(areas)) if areas else 0.0
+    report_items: list[DiceSuitabilityItem] = []
+
+    for index, item in enumerate(results, start=1):
+        bbox = [int(value) for value in item["bbox"]]
+        confidence = float(item["confidence"])
+        color_label = estimate_die_color(frame, bbox)
+        color_strength = estimate_die_color_strength(frame, bbox)
+        area = bbox[2] * bbox[3]
+        reasons: list[str] = []
+        status: Literal["PASS", "CHECK", "REMOVE"] = "PASS"
+
+        color_visible_blank = (
+            item["value"] == "blank"
+            and color_label in {"red/pink", "orange", "yellow/gold", "green", "blue/teal", "purple"}
+            and color_strength >= 0.40
+            and confidence >= 0.55
+        )
+
+        if confidence < 0.58 and not color_visible_blank:
+            status = "CHECK"
+            reasons.append("low confidence")
+        if color_visible_blank:
+            reasons.append("colored blank face is clearly separated from tray")
+        if median_area > 0 and area > median_area * 2.2:
+            status = "CHECK"
+            reasons.append("oversized box, likely overlap")
+        if median_area > 0 and area < median_area * 0.45:
+            status = "CHECK"
+            reasons.append("small box, symbol may be weak")
+
+        if confidence < 0.45:
+            status = "REMOVE"
+            reasons.append("below usable confidence")
+
+        report_items.append(
+            DiceSuitabilityItem(
+                index=index,
+                value=item["value"],
+                confidence=confidence,
+                bbox=bbox,
+                color_label=color_label,
+                status=status,
+                reason=", ".join(reasons) if reasons else "usable",
+            )
+        )
+
+    return DiceSuitabilityReport(
+        ok=True,
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        dice_count=len(report_items),
+        items=report_items,
+    )
 
 
 async def broadcast_event(event_name: str, payload: dict, request_id: str | None = None) -> None:
@@ -459,13 +683,17 @@ def run_startup_diagnostics() -> bool:
             set_state(status="ERROR", message="Config Not Readable", active_dice_count=0)
 
     with camera_lock:
-        current_cap = cap
-        if current_cap is None or not current_cap.isOpened():
-            camera_ok = False
+        if app_config.camera_source_type == "ndi":
+            camera_ok = ndi_receiver is not None
+        else:
+            current_cap = cap
+            if current_cap is None or not current_cap.isOpened():
+                camera_ok = False
 
     if not camera_ok:
-        logger.critical("Startup diagnostic: camera open failed.")
-        set_state(status="ERROR", message="Camera Not Found", active_dice_count=0)
+        logger.critical("Startup diagnostic: video source open failed.")
+        message = "NDI Source Not Found" if app_config.camera_source_type == "ndi" else "Camera Not Found"
+        set_state(status="ERROR", message=message, active_dice_count=0)
     elif config_ok:
         set_state(status="IDLE", message="Waiting for roll request", active_dice_count=0)
 
@@ -597,13 +825,22 @@ def camera_worker_loop() -> None:
 
     while not camera_stop_event.is_set():
         with camera_lock:
-            current_cap = cap
-            if current_cap is None or not current_cap.isOpened():
-                frame = None
-            else:
-                ok, frame = current_cap.read()
-                if not ok:
+            if app_config.camera_source_type == "ndi":
+                current_ndi_receiver = ndi_receiver
+                if current_ndi_receiver is None:
                     frame = None
+                else:
+                    ok, frame = current_ndi_receiver.read()
+                    if not ok:
+                        frame = None
+            else:
+                current_cap = cap
+                if current_cap is None or not current_cap.isOpened():
+                    frame = None
+                else:
+                    ok, frame = current_cap.read()
+                    if not ok:
+                        frame = None
 
         if frame is None:
             now = time.monotonic()
@@ -615,7 +852,12 @@ def camera_worker_loop() -> None:
             if now - last_camera_reconnect_attempt >= camera_reconnect_interval_seconds:
                 last_camera_reconnect_attempt = now
                 if reconnect_camera():
-                    log_event(logging.INFO, f"Camera reconnected on index {camera_index}")
+                    source_label = (
+                        f"NDI source {app_config.ndi_source_name}"
+                        if app_config.camera_source_type == "ndi"
+                        else f"camera index {camera_index}"
+                    )
+                    log_event(logging.INFO, f"Camera reconnected on {source_label}")
                 elif runtime_state.system.status != "ERROR":
                     set_state(status="ERROR", message="Camera Not Found", active_dice_count=0)
             time.sleep(0.05)
@@ -651,7 +893,7 @@ def camera_worker_loop() -> None:
 
 
 def cleanup_camera() -> None:
-    global cap, camera_cleanup_done
+    global cap, ndi_receiver, camera_cleanup_done
     with camera_lock:
         if camera_cleanup_done:
             return
@@ -659,39 +901,116 @@ def cleanup_camera() -> None:
             cap.release()
             logger.info("Camera released.")
         cap = None
+        if ndi_receiver is not None:
+            ndi_receiver.release()
+            ndi_receiver = None
+            logger.info("NDI receiver released.")
         camera_cleanup_done = True
 
 
-def open_camera_device(index: int) -> cv2.VideoCapture | None:
-    candidate = cv2.VideoCapture(index)
+def frame_signal_metrics(frame: np.ndarray | None) -> tuple[bool, float | None, float | None]:
+    if frame is None or frame.size == 0:
+        return False, None, None
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    mean_intensity = float(np.mean(gray))
+    contrast = float(np.std(gray))
+    return mean_intensity > 8.0 and contrast > 3.0, mean_intensity, contrast
+
+
+def open_camera_device(index: int, require_signal: bool = True) -> cv2.VideoCapture | None:
+    backend_preferences = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+    for backend in backend_preferences:
+        candidate = cv2.VideoCapture(index, backend)
+        if candidate is None or not candidate.isOpened():
+            if candidate is not None:
+                candidate.release()
+            continue
+
+        ok, first_frame = candidate.read()
+        has_signal, _mean_intensity, _contrast = frame_signal_metrics(first_frame if ok else None)
+        if has_signal or (ok and not require_signal):
+            return candidate
+
+        candidate.release()
+    return None
+
+
+def probe_camera_option(index: int) -> CameraOption:
+    candidate = cv2.VideoCapture(index, cv2.CAP_DSHOW)
     if candidate is None or not candidate.isOpened():
         if candidate is not None:
             candidate.release()
-        return None
-    return candidate
+        return CameraOption(index=index, available=False)
+
+    ok, frame = candidate.read()
+    candidate.release()
+    has_signal, mean_intensity, contrast = frame_signal_metrics(frame if ok else None)
+    return CameraOption(
+        index=index,
+        available=bool(ok),
+        has_signal=has_signal,
+        mean_intensity=mean_intensity,
+        contrast=contrast,
+    )
 
 
-def switch_camera(index: int) -> bool:
-    global cap
+def switch_camera(index: int, require_signal: bool = True) -> bool:
+    global cap, ndi_receiver
     with camera_lock:
         previous = cap
-        replacement = open_camera_device(index)
+        replacement = open_camera_device(index, require_signal=require_signal)
         if replacement is None:
             return False
 
         cap = replacement
         if previous is not None and previous.isOpened():
             previous.release()
+        if ndi_receiver is not None:
+            ndi_receiver.release()
+            ndi_receiver = None
+    return True
+
+
+def switch_ndi_source(source_name: str) -> bool:
+    global cap, ndi_receiver
+    with camera_lock:
+        try:
+            replacement = NdiReceiver(source_name)
+        except RuntimeError as error:
+            log_event(logging.WARNING, f"NDI source switch failed: {error}")
+            return False
+
+        previous_ndi_receiver = ndi_receiver
+        previous_cap = cap
+        ndi_receiver = replacement
+        cap = None
+        if previous_ndi_receiver is not None:
+            previous_ndi_receiver.release()
+        if previous_cap is not None and previous_cap.isOpened():
+            previous_cap.release()
     return True
 
 
 def reconnect_camera() -> bool:
-    global cap
+    global cap, ndi_receiver
     with camera_lock:
+        if app_config.camera_source_type == "ndi":
+            if not app_config.ndi_source_name:
+                return False
+            if ndi_receiver is not None:
+                ndi_receiver.release()
+            try:
+                ndi_receiver = NdiReceiver(app_config.ndi_source_name)
+            except RuntimeError as error:
+                log_event(logging.WARNING, f"NDI reconnect failed: {error}")
+                ndi_receiver = None
+                return False
+            return True
+
         previous = cap
         if previous is not None:
             previous.release()
-        cap = open_camera_device(camera_index)
+        cap = open_camera_device(camera_index, require_signal=not app_config.force_no_signal_camera)
         return cap is not None
 
 
@@ -703,7 +1022,7 @@ def handle_exit_signal(signum: int, _frame: object) -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global camera_cleanup_done, camera_thread, cap, last_camera_reconnect_attempt, main_event_loop
+    global camera_cleanup_done, camera_thread, cap, ndi_receiver, last_camera_reconnect_attempt, main_event_loop
 
     main_event_loop = asyncio.get_running_loop()
     camera_cleanup_done = False
@@ -719,11 +1038,19 @@ async def lifespan(_app: FastAPI):
         config_ok = False
 
     with camera_lock:
-        cap = open_camera_device(camera_index)
-        if cap is None:
-            logger.error("Could not open camera at index %s.", camera_index)
+        if app_config.camera_source_type == "ndi" and app_config.ndi_source_name:
+            try:
+                ndi_receiver = NdiReceiver(app_config.ndi_source_name)
+                logger.info("NDI source initialized: %s.", app_config.ndi_source_name)
+            except RuntimeError as error:
+                ndi_receiver = None
+                logger.error("Could not open NDI source '%s': %s", app_config.ndi_source_name, error)
         else:
-            logger.info("Camera initialized at index %s.", camera_index)
+            cap = open_camera_device(camera_index, require_signal=not app_config.force_no_signal_camera)
+            if cap is None:
+                logger.error("Could not open camera at index %s.", camera_index)
+            else:
+                logger.info("Camera initialized at index %s.", camera_index)
 
     run_startup_diagnostics()
 
@@ -847,6 +1174,15 @@ async def get_calibration_quality() -> CalibrationQuality:
     return calculate_calibration_quality()
 
 
+@app.get("/api/dice_suitability", response_model=DiceSuitabilityReport)
+async def get_dice_suitability() -> DiceSuitabilityReport:
+    with latest_frame_lock:
+        frame = None if latest_raw_frame is None else latest_raw_frame.copy()
+    if frame is None:
+        raise HTTPException(status_code=503, detail="No camera frame is available.")
+    return build_suitability_report(frame)
+
+
 @app.get("/api/config", response_model=AppConfig)
 async def get_config() -> AppConfig:
     return app_config
@@ -856,26 +1192,47 @@ async def get_config() -> AppConfig:
 def list_cameras() -> list[CameraOption]:
     options: list[CameraOption] = []
     for index in range(5):
-        probe = open_camera_device(index)
-        available = probe is not None
-        if probe is not None:
-            probe.release()
-        options.append(CameraOption(index=index, available=available))
+        options.append(probe_camera_option(index))
     return options
 
 
 @app.post("/api/camera", response_model=AppConfig)
 def update_camera(selection: CameraSelectRequest) -> AppConfig:
     selected_index = selection.camera_index
-    if not switch_camera(selected_index):
+    if not switch_camera(selected_index, require_signal=not selection.force_no_signal):
         log_event(logging.WARNING, f"Requested camera index {selected_index} is unavailable")
         raise HTTPException(status_code=400, detail=f"Camera index {selected_index} is unavailable.")
 
     app_config.camera_index = selected_index
+    app_config.camera_source_type = "opencv"
+    app_config.ndi_source_name = None
+    app_config.force_no_signal_camera = selection.force_no_signal
     apply_config_to_runtime()
     write_config()
-    set_state(status="IDLE", message=f"Camera switched to index {selected_index}", active_dice_count=0)
-    log_event(logging.INFO, f"Camera switched to index {selected_index}")
+    message = f"Camera switched to index {selected_index}"
+    if selection.force_no_signal:
+        message = f"{message} with no-signal override"
+    set_state(status="IDLE", message=message, active_dice_count=0)
+    log_event(logging.INFO, message)
+    return app_config
+
+
+@app.get("/api/ndi/sources", response_model=list[NdiSourceOption])
+def get_ndi_sources() -> list[NdiSourceOption]:
+    return list_ndi_sources()
+
+
+@app.post("/api/ndi/source", response_model=AppConfig)
+def update_ndi_source(selection: NdiSourceSelectRequest) -> AppConfig:
+    if not switch_ndi_source(selection.source_name):
+        raise HTTPException(status_code=400, detail=f"NDI source '{selection.source_name}' is unavailable.")
+
+    app_config.camera_source_type = "ndi"
+    app_config.ndi_source_name = selection.source_name
+    apply_config_to_runtime()
+    write_config()
+    set_state(status="IDLE", message=f"NDI source selected: {selection.source_name}", active_dice_count=0)
+    log_event(logging.INFO, f"NDI source selected: {selection.source_name}")
     return app_config
 
 
@@ -886,6 +1243,8 @@ async def get_roi() -> RoiConfig:
 
 @app.post("/api/roi", response_model=RoiConfig)
 async def update_roi(updated: RoiConfig) -> RoiConfig:
+    if updated.roi is not None and (updated.roi[2] < 50 or updated.roi[3] < 50):
+        raise HTTPException(status_code=400, detail="ROI must be at least 50x50 pixels.")
     app_config.roi = updated.roi
     apply_config_to_runtime()
     write_config()

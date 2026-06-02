@@ -21,5 +21,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
+for /f "tokens=5" %%p in ('netstat -ano ^| findstr /R /C:":8000 .*LISTENING"') do (
+    taskkill /PID %%p /F >nul 2>nul
+)
+
 python main.py
 endlocal

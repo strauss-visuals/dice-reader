@@ -437,7 +437,9 @@ class VisionProcessor:
         # Most tested Fate dice use painted light/yellow marks on saturated
         # colored bodies. A fixed grayscale threshold sees the body as ink, so
         # detect paint by relative brightness and paint-like color first.
-        bright_floor = int(min(255, max(135, median_value + 30)))
+        median_saturation = float(np.median(saturation))
+        bright_offset = -5 if median_saturation > 80 else 30
+        bright_floor = int(min(255, max(135, median_value + bright_offset)))
         bright_pixels = cv2.inRange(value_channel, bright_floor, 255)
         low_saturation_pixels = cv2.inRange(saturation, 0, 110)
         yellow_pixels = cv2.inRange(hue, 15, 45)
@@ -456,7 +458,7 @@ class VisionProcessor:
             component_w = int(stats[label_id, cv2.CC_STAT_WIDTH])
             component_h = int(stats[label_id, cv2.CC_STAT_HEIGHT])
             near_face = (w * 0.05) <= center_x <= (w * 0.95) and (h * 0.05) <= center_y <= (h * 0.95)
-            not_glare_blob = area <= int(h * w * 0.18)
+            not_glare_blob = area <= int(h * w * 0.35)
             line_like = component_w >= int(w * 0.08) or component_h >= int(h * 0.08)
             if area >= min_component_area and near_face and not_glare_blob and line_like:
                 cleaned[labels == label_id] = 255
@@ -479,41 +481,86 @@ class VisionProcessor:
         center_vertical_peak = float(np.max(col_sums[center_col_start:center_col_end])) / float(h)
 
         if white_ratio >= self.config.blank_pixel_ratio_threshold and (
-            horizontal_peak > self.config.line_peak_threshold
-            and vertical_peak > 0.30
+            center_horizontal_peak > self.config.line_peak_threshold
+            and center_vertical_peak > 0.24
             and vertical_energy > 0.030
         ):
-            confidence = min(1.0, (horizontal_peak + vertical_peak + vertical_energy) / 3.0)
+            confidence = min(
+                1.0,
+                0.55 + (center_horizontal_peak * 0.25) + (center_vertical_peak * 0.25) + vertical_energy,
+            )
             confidence = max(self.config.minimum_confidence, confidence)
             return "+", confidence
 
-        if white_ratio >= self.config.blank_pixel_ratio_threshold * 0.65 or max(horizontal_peak, vertical_peak) >= 0.15:
-            confidence = min(1.0, (max(horizontal_peak, vertical_peak) + white_ratio + 0.35) / 3.0)
+        if (
+            white_ratio >= self.config.blank_pixel_ratio_threshold * 0.65
+            and center_horizontal_peak >= 0.15
+            and center_horizontal_peak >= (center_vertical_peak * 0.65)
+        ):
+            confidence = min(1.0, 0.55 + (center_horizontal_peak * 0.90) + (white_ratio * 1.50))
             confidence = max(self.config.minimum_confidence, confidence)
             return "-", confidence
 
-        # Fallback for pale dice with dark painted symbols. Avoid using this on
-        # saturated dice because their colored body can look like dark ink.
-        median_saturation = float(np.median(saturation))
-        if median_value > 150 and median_saturation < 80:
-            gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (3, 3), 0)
-            _, dark_binary = cv2.threshold(gray, self.config.symbol_threshold_value, 255, cv2.THRESH_BINARY_INV)
-            dark_binary = cv2.morphologyEx(dark_binary, cv2.MORPH_OPEN, kernel, iterations=1)
-            dark_ratio = float(cv2.countNonZero(dark_binary)) / float(h * w)
-            if dark_ratio >= self.config.blank_pixel_ratio_threshold:
-                dark_rows = np.sum(dark_binary > 0, axis=1)
-                dark_cols = np.sum(dark_binary > 0, axis=0)
-                dark_horizontal_peak = float(np.max(dark_rows)) / float(w)
-                dark_vertical_peak = float(np.max(dark_cols)) / float(h)
-                if dark_horizontal_peak > self.config.line_peak_threshold and dark_vertical_peak > 0.30:
-                    return "+", self.config.minimum_confidence
-                return "-", self.config.minimum_confidence
+        if (
+            white_ratio >= self.config.blank_pixel_ratio_threshold * 0.25
+            and center_horizontal_peak >= 0.12
+            and center_horizontal_peak >= (center_vertical_peak * 1.5)
+        ):
+            confidence = min(1.0, 0.55 + (center_horizontal_peak * 1.15) + (white_ratio * 2.00))
+            confidence = max(self.config.minimum_confidence, confidence)
+            return "-", confidence
+
+        # Generic fallback for dark painted symbols. It is intentionally stricter
+        # than the bright-paint path so blank colored dice are not read as marks.
+        gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        dark_floor = int(max(0, min(self.config.symbol_threshold_value, median_value - 45)))
+        _, dark_binary = cv2.threshold(gray, dark_floor, 255, cv2.THRESH_BINARY_INV)
+        dark_binary = cv2.morphologyEx(dark_binary, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        dark_num_labels, dark_labels, dark_stats, dark_centroids = cv2.connectedComponentsWithStats(dark_binary)
+        dark_cleaned = np.zeros_like(dark_binary)
+        for label_id in range(1, dark_num_labels):
+            area = int(dark_stats[label_id, cv2.CC_STAT_AREA])
+            center_x, center_y = dark_centroids[label_id]
+            component_w = int(dark_stats[label_id, cv2.CC_STAT_WIDTH])
+            component_h = int(dark_stats[label_id, cv2.CC_STAT_HEIGHT])
+            near_center = (w * 0.15) <= center_x <= (w * 0.85) and (h * 0.15) <= center_y <= (h * 0.85)
+            not_shadow_blob = area <= int(h * w * 0.35)
+            line_like = component_w >= int(w * 0.14) or component_h >= int(h * 0.14)
+            if area >= min_component_area and near_center and not_shadow_blob and line_like:
+                dark_cleaned[dark_labels == label_id] = 255
+
+        dark_ratio = float(cv2.countNonZero(dark_cleaned)) / float(h * w)
+        if dark_ratio >= self.config.blank_pixel_ratio_threshold * 0.65:
+            dark_rows = np.sum(dark_cleaned > 0, axis=1)
+            dark_cols = np.sum(dark_cleaned > 0, axis=0)
+            dark_horizontal_peak = float(np.max(dark_rows)) / float(w)
+            dark_vertical_peak = float(np.max(dark_cols)) / float(h)
+            dark_vertical_energy = float(np.mean(dark_cols)) / float(h)
+            if (
+                dark_horizontal_peak > self.config.line_peak_threshold
+                and dark_vertical_peak > 0.30
+                and dark_vertical_energy > 0.030
+            ):
+                confidence = min(
+                    1.0,
+                    0.55 + (dark_horizontal_peak * 0.25) + (dark_vertical_peak * 0.25) + dark_vertical_energy,
+                )
+                return "+", max(self.config.minimum_confidence, confidence)
+            confidence = min(1.0, 0.55 + (dark_horizontal_peak * 0.90) + (dark_ratio * 1.50))
+            return "-", max(self.config.minimum_confidence, confidence)
 
         confidence = max(
             self.config.minimum_confidence,
             1.0 - (white_ratio / self.config.blank_pixel_ratio_threshold),
         )
+        if median_saturation >= 90 and white_ratio < self.config.blank_pixel_ratio_threshold * 0.65:
+            # A clean saturated face is easier to separate from the tray than a
+            # gray/white face. Treat that as positive evidence for a blank die,
+            # but do not boost if paint-like pixels are close to symbol levels.
+            color_blank_confidence = 0.70 + min(0.20, (median_saturation - 90.0) / 650.0)
+            confidence = max(confidence, color_blank_confidence)
         return "blank", min(1.0, confidence)
 
     def calculate_roll(self, frame: np.ndarray) -> list[dict]:

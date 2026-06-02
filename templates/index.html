@@ -362,6 +362,28 @@
       <p id="qualityMessage" class="statusReason">Waiting for calibration metrics...</p>
     </section>
 
+    <section class="statusPanel" aria-label="Dice Suitability">
+      <div class="statusRow">
+        <strong>Dice Suitability</strong>
+        <button id="analyzeSuitabilityButton" type="button">Analyze Dice</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Value</th>
+            <th>Confidence</th>
+            <th>Color</th>
+            <th>Status</th>
+            <th>Reason</th>
+          </tr>
+        </thead>
+        <tbody id="suitabilityBody">
+          <tr><td colspan="6">No suitability report yet.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
     <section class="statusPanel" aria-label="Vision Calibration">
       <div class="statusRow">
         <strong>Vision Calibration</strong>
@@ -386,6 +408,19 @@
           <select id="cameraSelect">
             <option value="">Scanning cameras...</option>
           </select>
+        </div>
+        <div class="controlBlock">
+          <label for="ndiSourceSelect">NDI Source</label>
+          <select id="ndiSourceSelect">
+            <option value="">Scanning NDI...</option>
+          </select>
+        </div>
+        <div class="controlBlock">
+          <label>NDI Actions</label>
+          <div class="controlsRow">
+            <button id="refreshNdiButton" type="button">Refresh</button>
+            <button id="useNdiButton" type="button">Use NDI</button>
+          </div>
         </div>
         <div class="controlBlock">
           <label for="stageSelect">Feed View</label>

@@ -1,18 +1,21 @@
 {
   "camera_index": 0,
+  "camera_source_type": "ndi",
+  "ndi_source_name": "STRAUSSS-S24 (NDI HX Camera)",
+  "force_no_signal_camera": false,
   "roi": [
-    950,
-    0,
-    1350,
-    1300
+    202,
+    6,
+    2096,
+    2004
   ],
   "vision": {
     "motion_threshold": 840,
     "motion_diff_threshold": 45,
     "settlement_seconds": 1.0,
-    "contour_min_area": 10000,
-    "contour_max_area": 100000,
-    "symbol_threshold_value": 147
+    "contour_min_area": 7000,
+    "contour_max_area": 20000,
+    "symbol_threshold_value": 77
   },
   "calibration_profiles": {}
 }
