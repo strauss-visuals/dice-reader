@@ -4,10 +4,10 @@
   "ndi_source_name": "STRAUSSS-S24 (NDI HX Camera)",
   "force_no_signal_camera": false,
   "roi": [
-    202,
-    6,
-    2096,
-    2004
+    251,
+    32,
+    1832,
+    847
   ],
   "vision": {
     "motion_threshold": 840,
