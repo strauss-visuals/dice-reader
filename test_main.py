@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from uuid import uuid4
 
 import cv2
@@ -415,3 +416,64 @@ def test_websocket_ping_and_config_update_protocol() -> None:
             assert updated["data"]["expected_dice_count"] == 4
             assert updated["data"]["timeout_seconds"] == 12
             assert main.runtime_state.expected_dice_count == 4
+
+
+def test_bridge_command_rejects_overlong_request_id() -> None:
+    with pytest.raises(ValidationError):
+        main.BridgeCommand(type="roll.request", request_id="x" * 121)
+
+
+def test_process_settled_frame_cleans_request_on_dice_count_mismatch(monkeypatch) -> None:
+    scheduled = []
+
+    def fake_schedule(coro):
+        scheduled.append(coro)
+        coro.close()
+
+    monkeypatch.setattr(main.vision, "calculate_roll", lambda frame: [])
+    monkeypatch.setattr(main, "schedule_coroutine", fake_schedule)
+    main.runtime_state.expected_dice_count = 3
+    main.active_request_id = "mismatch-request"
+
+    main.process_settled_frame(np.zeros((80, 80, 3), dtype=np.uint8))
+
+    assert main.runtime_state.system.status == "ERROR"
+    assert main.runtime_state.system.message == "Detected 0 dice, expected 3."
+    assert main.active_request_id is None
+    assert main.watch_timeout_task is None
+    assert main.error_reset_task is None
+    assert len(scheduled) == 2
+
+
+def test_still_image_snapshot_uses_uploaded_image_results(monkeypatch) -> None:
+    parsed_results = [{"value": "+", "confidence": 0.82, "bbox": [5, 6, 40, 40]}]
+    overlay_results = []
+
+    monkeypatch.setattr(main.vision, "calculate_roll_from_still_image", lambda frame: parsed_results)
+
+    def fake_draw_debug_overlay(frame, results=None):
+        overlay_results.append(results)
+        return frame
+
+    monkeypatch.setattr(main, "draw_debug_overlay", fake_draw_debug_overlay)
+    image = np.zeros((80, 80, 3), dtype=np.uint8)
+    ok, encoded = cv2.imencode(".jpg", image)
+    assert ok
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/api/still_image_roll",
+            content=encoded.tobytes(),
+            headers={"Content-Type": "image/jpeg"},
+        )
+
+    assert response.status_code == 200
+    assert overlay_results == [parsed_results]
+
+
+def test_troubleshooting_ui_uses_text_apis_for_dynamic_tables() -> None:
+    script = (Path("templates") / "app.js").read_text(encoding="utf-8")
+    assert "function appendTextCell" in script
+    assert "historyBody.replaceChildren(...rows)" in script
+    assert "suitabilityBody.replaceChildren(...rows)" in script
+    assert "innerHTML" not in script

@@ -147,40 +147,74 @@ async function fetchCalibrationQuality() {
   }
 }
 
+function appendTextCell(row, value) {
+  const cell = document.createElement("td");
+  cell.textContent = value ?? "";
+  row.appendChild(cell);
+  return cell;
+}
+
+function renderEmptyTableMessage(tableBody, colspan, message) {
+  const row = document.createElement("tr");
+  const cell = document.createElement("td");
+  cell.colSpan = colspan;
+  cell.textContent = message;
+  row.appendChild(cell);
+  tableBody.replaceChildren(row);
+}
+
 function renderHistoryRows(items) {
   if (!items.length) {
-    historyBody.innerHTML = "<tr><td colspan=\"8\">No rolls yet.</td></tr>";
+    renderEmptyTableMessage(historyBody, 8, "No rolls yet.");
     return;
   }
 
-  historyBody.innerHTML = items
+  const rows = items
     .slice()
     .reverse()
     .map((item) => {
-      const diceText = item.dice.map((die) => {
+      const row = document.createElement("tr");
+      appendTextCell(row, item.timestamp_utc);
+      appendTextCell(row, item.request_id || "-");
+      appendTextCell(row, item.total_score);
+      appendTextCell(row, item.is_fallback ? "yes" : "no");
+      appendTextCell(
+        row,
+        item.roll_confidence === null || item.roll_confidence === undefined
+          ? "-"
+          : Number(item.roll_confidence).toFixed(3),
+      );
+      appendTextCell(row, item.fallback_reason || "-");
+
+      const diceCell = document.createElement("td");
+      item.dice.forEach((die, index) => {
+        if (index > 0) {
+          diceCell.appendChild(document.createTextNode(" "));
+        }
         const confidence = Number(die.confidence);
-        const warningClass = confidence < 0.7 ? " low" : "";
-        return `<span class="confidenceBadge${warningClass}">${die.value} ${confidence.toFixed(2)}</span>`;
-      }).join(" ");
-      const confidenceText = item.roll_confidence === null || item.roll_confidence === undefined
-        ? "-"
-        : Number(item.roll_confidence).toFixed(3);
-      const reasonText = item.fallback_reason || "-";
-      const snapshotLink = item.snapshot_id
-        ? `<button type="button" class="snapshotPreviewButton" data-snapshot-id="${item.snapshot_id}">Open</button>`
-        : "-";
-      return `<tr>
-        <td>${item.timestamp_utc}</td>
-        <td>${item.request_id || "-"}</td>
-        <td>${item.total_score}</td>
-        <td>${item.is_fallback ? "yes" : "no"}</td>
-        <td>${confidenceText}</td>
-        <td>${reasonText}</td>
-        <td>${diceText}</td>
-        <td>${snapshotLink}</td>
-      </tr>`;
-    })
-    .join("");
+        const badge = document.createElement("span");
+        badge.className = `confidenceBadge${confidence < 0.7 ? " low" : ""}`;
+        badge.textContent = `${die.value} ${confidence.toFixed(2)}`;
+        diceCell.appendChild(badge);
+      });
+      row.appendChild(diceCell);
+
+      const snapshotCell = document.createElement("td");
+      if (item.snapshot_id) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "snapshotPreviewButton";
+        button.dataset.snapshotId = item.snapshot_id;
+        button.textContent = "Open";
+        snapshotCell.appendChild(button);
+      } else {
+        snapshotCell.textContent = "-";
+      }
+      row.appendChild(snapshotCell);
+      return row;
+    });
+
+  historyBody.replaceChildren(...rows);
 }
 
 function closeSnapshotModal() {
@@ -191,24 +225,21 @@ function closeSnapshotModal() {
 
 function renderSuitabilityReport(report) {
   if (!report.items.length) {
-    suitabilityBody.innerHTML = "<tr><td colspan=\"6\">No dice detected.</td></tr>";
+    renderEmptyTableMessage(suitabilityBody, 6, "No dice detected.");
     return;
   }
 
-  suitabilityBody.innerHTML = report.items
-    .map((item) => {
-      return `
-        <tr>
-          <td>${item.index}</td>
-          <td>${item.value}</td>
-          <td>${Number(item.confidence).toFixed(2)}</td>
-          <td>${item.color_label}</td>
-          <td>${item.status}</td>
-          <td>${item.reason}</td>
-        </tr>
-      `;
-    })
-    .join("");
+  const rows = report.items.map((item) => {
+    const row = document.createElement("tr");
+    appendTextCell(row, item.index);
+    appendTextCell(row, item.value);
+    appendTextCell(row, Number(item.confidence).toFixed(2));
+    appendTextCell(row, item.color_label);
+    appendTextCell(row, item.status);
+    appendTextCell(row, item.reason);
+    return row;
+  });
+  suitabilityBody.replaceChildren(...rows);
 }
 
 async function fetchDiceSuitability() {
@@ -315,7 +346,9 @@ async function loadVisionConfig() {
 function renderWizardStep() {
   const step = wizardSteps[wizardStepIndex];
   wizardProgress.textContent = `Step ${wizardStepIndex + 1} of ${wizardSteps.length}`;
-  wizardTitle.innerHTML = `<strong>${step.title}</strong>`;
+  const title = document.createElement("strong");
+  title.textContent = step.title;
+  wizardTitle.replaceChildren(title);
   wizardHint.textContent = step.hint;
   wizardBackButton.disabled = wizardStepIndex === 0;
   wizardNextButton.textContent = wizardStepIndex === wizardSteps.length - 1 ? "Finish" : "Next";
@@ -447,18 +480,18 @@ async function pushRoiConfig() {
 }
 
 function renderCameraOptions(cameras, activeIndex) {
-  cameraSelect.innerHTML = cameras
-    .map((camera) => {
-      const selected = camera.index === activeIndex ? "selected" : "";
-      let stateLabel = "unavailable";
-      if (camera.available && camera.has_signal) {
-        stateLabel = "signal";
-      } else if (camera.available) {
-        stateLabel = "no signal";
-      }
-      return `<option value="${camera.index}" ${selected}>Camera ${camera.index} (${stateLabel})</option>`;
-    })
-    .join("");
+  const options = cameras.map((camera) => {
+    let stateLabel = "unavailable";
+    if (camera.available && camera.has_signal) {
+      stateLabel = "signal";
+    } else if (camera.available) {
+      stateLabel = "no signal";
+    }
+    const option = new Option(`Camera ${camera.index} (${stateLabel})`, String(camera.index));
+    option.selected = camera.index === activeIndex;
+    return option;
+  });
+  cameraSelect.replaceChildren(...options);
 }
 
 async function loadCameraOptions(activeIndex) {
@@ -472,16 +505,16 @@ async function loadCameraOptions(activeIndex) {
 
 function renderNdiSources(sources, activeName) {
   if (!sources.length) {
-    ndiSourceSelect.innerHTML = "<option value=\"\">No NDI sources found</option>";
+    ndiSourceSelect.replaceChildren(new Option("No NDI sources found", ""));
     return;
   }
 
-  ndiSourceSelect.innerHTML = sources
-    .map((source) => {
-      const selected = source.name === activeName ? "selected" : "";
-      return `<option value="${source.name}" ${selected}>${source.name}</option>`;
-    })
-    .join("");
+  const options = sources.map((source) => {
+    const option = new Option(source.name, source.name);
+    option.selected = source.name === activeName;
+    return option;
+  });
+  ndiSourceSelect.replaceChildren(...options);
 }
 
 async function loadNdiSources(activeName = null) {
@@ -542,9 +575,12 @@ async function pushVisionConfig() {
 
 function renderProfileOptions(profiles) {
   const names = Object.keys(profiles).sort();
-  profileSelect.innerHTML = names.length
-    ? names.map((name) => `<option value="${name}">${name}</option>`).join("")
-    : "<option value=\"\">No profiles saved</option>";
+  if (!names.length) {
+    profileSelect.replaceChildren(new Option("No profiles saved", ""));
+    return;
+  }
+
+  profileSelect.replaceChildren(...names.map((name) => new Option(name, name)));
 }
 
 async function loadProfiles() {
