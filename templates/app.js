@@ -505,7 +505,7 @@ async function loadCameraOptions(activeIndex) {
 
 function renderNdiSources(sources, activeName) {
   if (!sources.length) {
-    ndiSourceSelect.replaceChildren(new Option("No NDI sources found", ""));
+    ndiSourceSelect.replaceChildren(new Option("No NDI sources found - refresh or switch to Camera", ""));
     return;
   }
 

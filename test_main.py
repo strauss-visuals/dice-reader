@@ -40,6 +40,7 @@ def isolated_config_file(tmp_path, monkeypatch):
     main.runtime_state.expected_dice_count = 3
     main.history.clear()
     main.roll_snapshots.clear()
+    main.ndi_reconnect_pause_until = 0.0
     yield
     main.cap = None
     main.app_config = original_config
@@ -47,6 +48,7 @@ def isolated_config_file(tmp_path, monkeypatch):
     main.apply_config_to_runtime()
     main.history.clear()
     main.roll_snapshots.clear()
+    main.ndi_reconnect_pause_until = 0.0
 
 
 def test_die_result_rejects_invalid_confidence() -> None:
@@ -348,6 +350,32 @@ def test_reconnect_camera_releases_old_capture_and_reopens_configured_device(mon
     assert main.reconnect_camera() is True
     assert old_capture.released is True
     assert main.cap is replacement
+
+
+def test_reconnect_camera_pauses_ndi_retries_when_source_is_missing(monkeypatch) -> None:
+    class FakeReceiver:
+        def __init__(self) -> None:
+            self.released = False
+
+        def release(self) -> None:
+            self.released = True
+
+    old_receiver = FakeReceiver()
+    monkeypatch.setattr(main.app_config, "camera_source_type", "ndi")
+    monkeypatch.setattr(main.app_config, "ndi_source_name", "Lobby Camera")
+    monkeypatch.setattr(main, "ndi_receiver", old_receiver)
+    monkeypatch.setattr(main, "ndi_reconnect_pause_until", 0.0)
+    monkeypatch.setattr(main.time, "monotonic", lambda: 100.0)
+
+    def fake_ndi_receiver(source_name: str):
+        raise main.NdiSourceNotFoundError(source_name)
+
+    monkeypatch.setattr(main, "NdiReceiver", fake_ndi_receiver)
+
+    assert main.reconnect_camera() is False
+    assert old_receiver.released is True
+    assert main.ndi_receiver is None
+    assert main.ndi_reconnect_pause_until == 130.0
 
 
 def test_fallback_roll_requires_active_websocket() -> None:

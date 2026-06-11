@@ -150,6 +150,12 @@ class CalibrationQuality(BaseModel):
     recent_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
+class NdiSourceNotFoundError(RuntimeError):
+    def __init__(self, source_name: str) -> None:
+        self.source_name = source_name
+        super().__init__(f"NDI source '{source_name}' was not found.")
+
+
 class RollHistoryItem(BaseModel):
     timestamp_utc: str
     request_id: str | None = None
@@ -212,6 +218,8 @@ camera_thread: threading.Thread | None = None
 camera_stop_event = threading.Event()
 last_camera_reconnect_attempt: float = 0.0
 camera_reconnect_interval_seconds = 2.0
+ndi_reconnect_pause_until: float = 0.0
+ndi_reconnect_pause_seconds = 30.0
 
 latest_frame_lock = threading.Lock()
 latest_jpeg_frame: bytes | None = None
@@ -253,6 +261,17 @@ def append_history(payload: RollPayload, request_id: str | None, snapshot_bytes:
 def log_event(level: int, message: str, request_id: str | None = None) -> None:
     suffix = f" | request_id={request_id}" if request_id else ""
     logger.log(level, f"{message}{suffix}")
+
+
+def ndi_recovery_message(source_name: str | None) -> str:
+    if source_name:
+        return f"NDI source '{source_name}' not found. Refresh sources or switch to Camera."
+    return "NDI source not found. Refresh sources or switch to Camera."
+
+
+def pause_ndi_reconnects(now: float | None = None) -> None:
+    global ndi_reconnect_pause_until
+    ndi_reconnect_pause_until = (now if now is not None else time.monotonic()) + ndi_reconnect_pause_seconds
 
 
 def calculate_calibration_quality() -> CalibrationQuality:
@@ -364,7 +383,7 @@ class NdiReceiver:
 
         source = self._find_source(source_name)
         if source is None:
-            raise RuntimeError(f"NDI source '{source_name}' was not found.")
+            raise NdiSourceNotFoundError(source_name)
 
         settings = ndi.RecvCreateV3()
         settings.source_to_connect_to = source
@@ -692,7 +711,11 @@ def run_startup_diagnostics() -> bool:
 
     if not camera_ok:
         logger.critical("Startup diagnostic: video source open failed.")
-        message = "NDI Source Not Found" if app_config.camera_source_type == "ndi" else "Camera Not Found"
+        message = (
+            ndi_recovery_message(app_config.ndi_source_name)
+            if app_config.camera_source_type == "ndi"
+            else "Camera Not Found"
+        )
         set_state(status="ERROR", message=message, active_dice_count=0)
     elif config_ok:
         set_state(status="IDLE", message="Waiting for roll request", active_dice_count=0)
@@ -858,8 +881,14 @@ def camera_worker_loop() -> None:
                 frame_failure_started = now
             if now - frame_failure_started >= camera_reconnect_interval_seconds:
                 if runtime_state.system.status not in {"WATCHING", "CALCULATING"}:
-                    set_state(status="ERROR", message="Camera Not Providing Frames", active_dice_count=0)
-            if now - last_camera_reconnect_attempt >= camera_reconnect_interval_seconds:
+                    message = (
+                        ndi_recovery_message(app_config.ndi_source_name)
+                        if app_config.camera_source_type == "ndi"
+                        else "Camera Not Providing Frames"
+                    )
+                    set_state(status="ERROR", message=message, active_dice_count=0)
+            ndi_retry_paused = app_config.camera_source_type == "ndi" and ndi_reconnect_pause_until > now
+            if not ndi_retry_paused and now - last_camera_reconnect_attempt >= camera_reconnect_interval_seconds:
                 last_camera_reconnect_attempt = now
                 if reconnect_camera():
                     source_label = (
@@ -869,15 +898,26 @@ def camera_worker_loop() -> None:
                     )
                     log_event(logging.INFO, f"Camera reconnected on {source_label}")
                 elif runtime_state.system.status != "ERROR":
-                    set_state(status="ERROR", message="Camera Not Found", active_dice_count=0)
+                    message = (
+                        ndi_recovery_message(app_config.ndi_source_name)
+                        if app_config.camera_source_type == "ndi"
+                        else "Camera Not Found"
+                    )
+                    set_state(status="ERROR", message=message, active_dice_count=0)
             time.sleep(0.05)
             continue
 
         frame_failure_started = None
-        if runtime_state.system.status == "ERROR" and runtime_state.system.message in {
-            "Camera Not Found",
-            "Camera Not Providing Frames",
-        }:
+        if runtime_state.system.status == "ERROR" and (
+            runtime_state.system.message in {
+                "Camera Not Found",
+                "Camera Not Providing Frames",
+            }
+            or (
+                app_config.camera_source_type == "ndi"
+                and (runtime_state.system.message or "").startswith("NDI source ")
+            )
+        ):
             set_state(status="IDLE", message="Camera reconnected", active_dice_count=0)
 
         with latest_frame_lock:
@@ -982,7 +1022,7 @@ def switch_camera(index: int, require_signal: bool = True) -> bool:
 
 
 def switch_ndi_source(source_name: str) -> bool:
-    global cap, ndi_receiver
+    global cap, ndi_receiver, ndi_reconnect_pause_until
     with camera_lock:
         try:
             replacement = NdiReceiver(source_name)
@@ -993,6 +1033,7 @@ def switch_ndi_source(source_name: str) -> bool:
         previous_ndi_receiver = ndi_receiver
         previous_cap = cap
         ndi_receiver = replacement
+        ndi_reconnect_pause_until = 0.0
         cap = None
         if previous_ndi_receiver is not None:
             previous_ndi_receiver.release()
@@ -1002,7 +1043,7 @@ def switch_ndi_source(source_name: str) -> bool:
 
 
 def reconnect_camera() -> bool:
-    global cap, ndi_receiver
+    global cap, ndi_receiver, ndi_reconnect_pause_until
     with camera_lock:
         if app_config.camera_source_type == "ndi":
             if not app_config.ndi_source_name:
@@ -1011,6 +1052,12 @@ def reconnect_camera() -> bool:
                 ndi_receiver.release()
             try:
                 ndi_receiver = NdiReceiver(app_config.ndi_source_name)
+                ndi_reconnect_pause_until = 0.0
+            except NdiSourceNotFoundError as error:
+                log_event(logging.WARNING, f"NDI reconnect paused: {error}")
+                ndi_receiver = None
+                pause_ndi_reconnects()
+                return False
             except RuntimeError as error:
                 log_event(logging.WARNING, f"NDI reconnect failed: {error}")
                 ndi_receiver = None
@@ -1032,12 +1079,13 @@ def handle_exit_signal(signum: int, _frame: object) -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global camera_cleanup_done, camera_thread, cap, ndi_receiver, last_camera_reconnect_attempt, main_event_loop
+    global camera_cleanup_done, camera_thread, cap, ndi_receiver, last_camera_reconnect_attempt, main_event_loop, ndi_reconnect_pause_until
 
     main_event_loop = asyncio.get_running_loop()
     camera_cleanup_done = False
     camera_stop_event.clear()
     last_camera_reconnect_attempt = 0.0
+    ndi_reconnect_pause_until = 0.0
     config_ok = True
 
     try:
