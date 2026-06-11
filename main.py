@@ -1430,6 +1430,8 @@ async def fallback_roll() -> dict:
     global active_request_id, error_reset_task, watch_timeout_task
     if game_bridge_socket is None:
         raise HTTPException(status_code=409, detail="No active game bridge WebSocket connection.")
+    if active_request_id is None or runtime_state.system.status not in {"WATCHING", "CALCULATING"}:
+        raise HTTPException(status_code=409, detail="No active roll request is waiting for fallback.")
 
     cancel_task(watch_timeout_task)
     watch_timeout_task = None
@@ -1459,6 +1461,12 @@ async def fallback_roll() -> dict:
 async def game_bridge(websocket: WebSocket) -> None:
     global active_request_id, error_reset_task, game_bridge_socket, heartbeat_task, last_heartbeat_ts, watch_timeout_task
     await websocket.accept()
+    if game_bridge_socket is not None:
+        log_event(logging.WARNING, f"Rejected duplicate game bridge connection: {websocket.client}")
+        await send_bridge_error(websocket, "BRIDGE_ALREADY_CONNECTED", message="Only one game bridge WebSocket connection is allowed.")
+        await websocket.close(code=1008)
+        return
+
     game_bridge_socket = websocket
     last_heartbeat_ts = time.time()
     cancel_task(heartbeat_task)
