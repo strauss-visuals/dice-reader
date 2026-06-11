@@ -72,7 +72,7 @@ class SystemState(BaseModel):
 class BridgeCommand(BaseModel):
     type: str | None = None
     action: str | None = None
-    request_id: str | None = None
+    request_id: str | None = Field(default=None, max_length=120)
     client_name: str | None = Field(default=None, max_length=80)
     config: RollConfig | None = None
 
@@ -463,9 +463,9 @@ def update_debug_overlay(results: list[dict] | None = None, motion_pixels: int |
             latest_motion_pixels = motion_pixels
 
 
-def draw_debug_overlay(frame):
+def draw_debug_overlay(frame, results: list[dict] | None = None):
     with debug_overlay_lock:
-        current_results = list(debug_dice_results)
+        current_results = list(debug_dice_results) if results is None else list(results)
         motion_value = latest_motion_pixels
 
     cv2.putText(
@@ -742,6 +742,15 @@ def build_roll_payload_from_dice(parsed_results: list[dict]) -> RollPayload:
     )
 
 
+def clear_active_roll_request() -> None:
+    global active_request_id, error_reset_task, watch_timeout_task
+    cancel_task(watch_timeout_task)
+    watch_timeout_task = None
+    cancel_task(error_reset_task)
+    error_reset_task = None
+    active_request_id = None
+
+
 async def reset_to_idle_after_delay(delay_seconds: float) -> None:
     await asyncio.sleep(delay_seconds)
     if runtime_state.system.status == "ERROR":
@@ -751,7 +760,7 @@ async def reset_to_idle_after_delay(delay_seconds: float) -> None:
 
 
 async def handle_roll_timeout(timeout_seconds: int) -> None:
-    global error_reset_task
+    global active_request_id, error_reset_task, watch_timeout_task
     try:
         await asyncio.sleep(timeout_seconds)
         if runtime_state.system.status == "WATCHING":
@@ -760,12 +769,15 @@ async def handle_roll_timeout(timeout_seconds: int) -> None:
                 message="Timeout reached: no settlement detected.",
                 active_dice_count=runtime_state.expected_dice_count,
             )
-            log_event(logging.WARNING, f"Roll request timed out after {timeout_seconds} seconds", request_id=active_request_id)
+            request_id = active_request_id
+            log_event(logging.WARNING, f"Roll request timed out after {timeout_seconds} seconds", request_id=request_id)
             await broadcast_event(
                 "ROLL_ERROR",
                 {"reason": "TIMEOUT_REACHED_NO_SETTLEMENT"},
-                request_id=active_request_id,
+                request_id=request_id,
             )
+            active_request_id = None
+            watch_timeout_task = None
             cancel_task(error_reset_task)
             error_reset_task = asyncio.create_task(reset_to_idle_after_delay(2.0))
     except asyncio.CancelledError:
@@ -774,7 +786,7 @@ async def handle_roll_timeout(timeout_seconds: int) -> None:
 
 
 def process_settled_frame(frame) -> None:
-    global active_request_id, watch_timeout_task
+    global active_request_id
 
     set_state(
         status="CALCULATING",
@@ -787,34 +799,32 @@ def process_settled_frame(frame) -> None:
     expected_count = runtime_state.expected_dice_count
 
     if len(parsed_results) != expected_count:
+        request_id = active_request_id
         set_state(
             status="ERROR",
             message=f"Detected {len(parsed_results)} dice, expected {expected_count}.",
             active_dice_count=len(parsed_results),
         )
         schedule_coroutine(
-            broadcast_event("ROLL_ERROR", {"reason": "DICE_COUNT_MISMATCH"}, request_id=active_request_id)
+            broadcast_event("ROLL_ERROR", {"reason": "DICE_COUNT_MISMATCH"}, request_id=request_id)
         )
         schedule_coroutine(reset_to_idle_after_delay(2.0))
+        clear_active_roll_request()
         vision.reset_motion_history()
         return
 
     payload = build_roll_payload_from_dice(parsed_results)
-    schedule_coroutine(broadcast_event("ROLL_COMPLETE", payload.model_dump(), request_id=active_request_id))
+    request_id = active_request_id
+    schedule_coroutine(broadcast_event("ROLL_COMPLETE", payload.model_dump(), request_id=request_id))
     snapshot_bytes = None
-    ok, encoded = cv2.imencode(".jpg", draw_debug_overlay(frame.copy()))
+    ok, encoded = cv2.imencode(".jpg", draw_debug_overlay(frame.copy(), parsed_results))
     if ok:
         snapshot_bytes = encoded.tobytes()
-    append_history(payload, active_request_id, snapshot_bytes=snapshot_bytes)
-    log_event(logging.INFO, f"Roll complete with score={payload.total_score}", request_id=active_request_id)
+    append_history(payload, request_id, snapshot_bytes=snapshot_bytes)
+    log_event(logging.INFO, f"Roll complete with score={payload.total_score}", request_id=request_id)
 
-    cancel_task(watch_timeout_task)
-    watch_timeout_task = None
-    cancel_task(error_reset_task)
-    error_reset_task = None
-
+    clear_active_roll_request()
     set_state(status="IDLE", message="Roll complete", active_dice_count=0)
-    active_request_id = None
     vision.reset_motion_history()
 
 
@@ -1303,7 +1313,7 @@ async def still_image_roll(request: Request) -> RollPayload:
     payload = build_roll_payload_from_dice(parsed_results)
 
     snapshot_bytes = None
-    ok, encoded = cv2.imencode(".jpg", draw_debug_overlay(frame.copy()))
+    ok, encoded = cv2.imencode(".jpg", draw_debug_overlay(frame.copy(), parsed_results))
     if ok:
         snapshot_bytes = encoded.tobytes()
     append_history(payload, request_id="still-image-upload", snapshot_bytes=snapshot_bytes)
@@ -1536,17 +1546,14 @@ async def game_bridge(websocket: WebSocket) -> None:
                     request_id=parsed.request_id,
                 )
     except WebSocketDisconnect:
-        cancel_task(heartbeat_task)
-        heartbeat_task = None
-        cancel_task(watch_timeout_task)
-        watch_timeout_task = None
-        cancel_task(error_reset_task)
-        error_reset_task = None
-        active_request_id = None
-        set_state(status="IDLE", message="Waiting for roll request", active_dice_count=0)
-        update_debug_overlay(results=[], motion_pixels=0)
-        vision.reset_motion_history()
-        game_bridge_socket = None
+        if websocket is game_bridge_socket:
+            cancel_task(heartbeat_task)
+            heartbeat_task = None
+            clear_active_roll_request()
+            set_state(status="IDLE", message="Waiting for roll request", active_dice_count=0)
+            update_debug_overlay(results=[], motion_pixels=0)
+            vision.reset_motion_history()
+            game_bridge_socket = None
         log_event(logging.INFO, f"Game bridge disconnected: {websocket.client}")
 
 
