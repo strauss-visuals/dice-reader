@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from starlette.websockets import WebSocketDisconnect
 
 import main
 
@@ -383,6 +384,39 @@ def test_fallback_roll_requires_active_websocket() -> None:
         response = client.post("/api/fallback_roll")
         assert response.status_code == 409
         assert "No active game bridge WebSocket connection" in response.json()["detail"]
+
+
+def test_fallback_roll_requires_active_roll_request() -> None:
+    with TestClient(main.app) as client:
+        with client.websocket_connect("/ws/game-bridge") as websocket:
+            connected = websocket.receive_json()
+            assert connected["type"] == "connect.ok"
+
+            response = client.post("/api/fallback_roll")
+
+            assert response.status_code == 409
+            assert "No active roll request" in response.json()["detail"]
+            assert main.active_request_id is None
+
+
+def test_duplicate_websocket_bridge_connection_is_rejected() -> None:
+    with TestClient(main.app) as client:
+        with client.websocket_connect("/ws/game-bridge") as first_socket:
+            connected = first_socket.receive_json()
+            assert connected["type"] == "connect.ok"
+
+            with client.websocket_connect("/ws/game-bridge") as second_socket:
+                duplicate_error = second_socket.receive_json()
+                assert duplicate_error["type"] == "error"
+                assert duplicate_error["event"] == "ROLL_ERROR"
+                assert duplicate_error["data"]["reason"] == "BRIDGE_ALREADY_CONNECTED"
+                with pytest.raises(WebSocketDisconnect):
+                    second_socket.receive_json()
+
+            first_socket.send_json({"type": "ping", "request_id": "first-still-active"})
+            pong = first_socket.receive_json()
+            assert pong["type"] == "pong"
+            assert pong["request_id"] == "first-still-active"
 
 
 def test_websocket_request_ack_and_fallback_roll_complete() -> None:
