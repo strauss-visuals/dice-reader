@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from uuid import uuid4
@@ -9,6 +10,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from starlette.websockets import WebSocketDisconnect
 
 import main
 
@@ -109,6 +111,25 @@ def test_camera_update_rejects_unavailable_index() -> None:
 def test_roi_endpoint_rejects_invalid_shape() -> None:
     with TestClient(main.app) as client:
         response = client.post("/api/roi", json={"roi": [1, 2, 3]})
+        assert response.status_code == 422
+
+
+def test_vision_config_rejects_inverted_contour_area_range() -> None:
+    with pytest.raises(ValidationError):
+        main.VisionTuningConfig(contour_min_area=2000, contour_max_area=1000)
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/api/config/vision",
+            json={
+                "motion_threshold": 2000,
+                "motion_diff_threshold": 45,
+                "settlement_seconds": 1.0,
+                "contour_min_area": 2000,
+                "contour_max_area": 1000,
+                "symbol_threshold_value": 211,
+            },
+        )
         assert response.status_code == 422
 
 
@@ -223,6 +244,40 @@ def test_still_image_roll_rejects_unreadable_image() -> None:
 
     assert response.status_code == 400
     assert "not a readable image" in response.json()["detail"]
+
+
+def test_still_image_roll_rejects_oversized_upload(monkeypatch) -> None:
+    monkeypatch.setattr(main, "STILL_IMAGE_MAX_BYTES", 5)
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/api/still_image_roll",
+            content=b"abcdef",
+            headers={"Content-Type": "image/jpeg"},
+        )
+
+    assert response.status_code == 413
+    assert "too large" in response.json()["detail"]
+
+
+def test_still_image_roll_rejects_negative_content_length() -> None:
+    async def fake_stream():
+        yield b""
+
+    request = type(
+        "FakeRequest",
+        (),
+        {
+            "headers": {"content-length": "-1"},
+            "stream": lambda self: fake_stream(),
+        },
+    )()
+
+    with pytest.raises(main.HTTPException) as error:
+        asyncio.run(main.read_limited_request_body(request, 5))
+
+    assert error.value.status_code == 400
+    assert "Invalid Content-Length" in error.value.detail
 
 
 def test_settlement_tolerates_small_camera_noise() -> None:
@@ -383,6 +438,62 @@ def test_fallback_roll_requires_active_websocket() -> None:
         response = client.post("/api/fallback_roll")
         assert response.status_code == 409
         assert "No active game bridge WebSocket connection" in response.json()["detail"]
+
+
+def test_fallback_roll_requires_active_roll_request() -> None:
+    with TestClient(main.app) as client:
+        with client.websocket_connect("/ws/game-bridge") as websocket:
+            connected = websocket.receive_json()
+            assert connected["type"] == "connect.ok"
+
+            response = client.post("/api/fallback_roll")
+
+            assert response.status_code == 409
+            assert "No active roll request" in response.json()["detail"]
+            assert main.active_request_id is None
+
+
+def test_fallback_roll_rejects_calculating_state(monkeypatch) -> None:
+    class FakeSocket:
+        pass
+
+    monkeypatch.setattr(main, "game_bridge_socket", FakeSocket())
+    monkeypatch.setattr(main, "active_request_id", "calculating-request")
+    monkeypatch.setattr(
+        main.runtime_state,
+        "system",
+        main.SystemState(
+            status="CALCULATING",
+            message="Dice settled. Calculating roll.",
+            active_dice_count=3,
+        ),
+    )
+
+    with TestClient(main.app) as client:
+        response = client.post("/api/fallback_roll")
+
+    assert response.status_code == 409
+    assert "No active roll request" in response.json()["detail"]
+
+
+def test_duplicate_websocket_bridge_connection_is_rejected() -> None:
+    with TestClient(main.app) as client:
+        with client.websocket_connect("/ws/game-bridge") as first_socket:
+            connected = first_socket.receive_json()
+            assert connected["type"] == "connect.ok"
+
+            with client.websocket_connect("/ws/game-bridge") as second_socket:
+                duplicate_error = second_socket.receive_json()
+                assert duplicate_error["type"] == "error"
+                assert duplicate_error["event"] == "ROLL_ERROR"
+                assert duplicate_error["data"]["reason"] == "BRIDGE_ALREADY_CONNECTED"
+                with pytest.raises(WebSocketDisconnect):
+                    second_socket.receive_json()
+
+            first_socket.send_json({"type": "ping", "request_id": "first-still-active"})
+            pong = first_socket.receive_json()
+            assert pong["type"] == "pong"
+            assert pong["request_id"] == "first-still-active"
 
 
 def test_websocket_request_ack_and_fallback_roll_complete() -> None:
