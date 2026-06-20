@@ -107,6 +107,12 @@ class CalibrationProfile(BaseModel):
     roi: list[int] | None = Field(default=None, min_length=4, max_length=4)
     vision: VisionTuningConfig = Field(default_factory=VisionTuningConfig)
 
+    @model_validator(mode="after")
+    def validate_roi_values(self) -> "CalibrationProfile":
+        if self.roi is not None and any(value < 0 for value in self.roi):
+            raise ValueError("ROI coordinates and dimensions must be non-negative")
+        return self
+
 
 class AppConfig(BaseModel):
     camera_index: int = Field(default=0, ge=0)
@@ -116,6 +122,12 @@ class AppConfig(BaseModel):
     roi: list[int] | None = Field(default=None, min_length=4, max_length=4)
     vision: VisionTuningConfig = Field(default_factory=VisionTuningConfig)
     calibration_profiles: dict[str, CalibrationProfile] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_roi_values(self) -> "AppConfig":
+        if self.roi is not None and any(value < 0 for value in self.roi):
+            raise ValueError("ROI coordinates and dimensions must be non-negative")
+        return self
 
 
 class CameraOption(BaseModel):
@@ -146,6 +158,12 @@ class CalibrationProfileRequest(BaseModel):
 
 class RoiConfig(BaseModel):
     roi: list[int] | None = Field(default=None, min_length=4, max_length=4)
+
+    @model_validator(mode="after")
+    def validate_roi_values(self) -> "RoiConfig":
+        if self.roi is not None and any(value < 0 for value in self.roi):
+            raise ValueError("ROI coordinates and dimensions must be non-negative")
+        return self
 
 
 class CalibrationQuality(BaseModel):

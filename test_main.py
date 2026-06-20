@@ -114,6 +114,19 @@ def test_roi_endpoint_rejects_invalid_shape() -> None:
         assert response.status_code == 422
 
 
+def test_roi_endpoint_rejects_negative_values() -> None:
+    with pytest.raises(ValidationError):
+        main.RoiConfig(roi=[-1, 0, 300, 220])
+    with pytest.raises(ValidationError):
+        main.AppConfig(roi=[0, -1, 300, 220])
+    with pytest.raises(ValidationError):
+        main.CalibrationProfile(roi=[0, 0, -300, 220])
+
+    with TestClient(main.app) as client:
+        response = client.post("/api/roi", json={"roi": [-1, 0, 300, 220]})
+        assert response.status_code == 422
+
+
 def test_vision_config_rejects_inverted_contour_area_range() -> None:
     with pytest.raises(ValidationError):
         main.VisionTuningConfig(contour_min_area=2000, contour_max_area=1000)
