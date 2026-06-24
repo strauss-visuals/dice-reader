@@ -22,7 +22,7 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from vision import VisionConfig, VisionProcessor
 
@@ -96,10 +96,22 @@ class VisionTuningConfig(BaseModel):
     contour_max_area: int = Field(default=28100, ge=1)
     symbol_threshold_value: int = Field(default=211, ge=0, le=255)
 
+    @model_validator(mode="after")
+    def validate_area_range(self) -> "VisionTuningConfig":
+        if self.contour_min_area > self.contour_max_area:
+            raise ValueError("contour_min_area must be less than or equal to contour_max_area")
+        return self
+
 
 class CalibrationProfile(BaseModel):
     roi: list[int] | None = Field(default=None, min_length=4, max_length=4)
     vision: VisionTuningConfig = Field(default_factory=VisionTuningConfig)
+
+    @model_validator(mode="after")
+    def validate_roi_values(self) -> "CalibrationProfile":
+        if self.roi is not None and any(value < 0 for value in self.roi):
+            raise ValueError("ROI coordinates and dimensions must be non-negative")
+        return self
 
 
 class AppConfig(BaseModel):
@@ -110,6 +122,12 @@ class AppConfig(BaseModel):
     roi: list[int] | None = Field(default=None, min_length=4, max_length=4)
     vision: VisionTuningConfig = Field(default_factory=VisionTuningConfig)
     calibration_profiles: dict[str, CalibrationProfile] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_roi_values(self) -> "AppConfig":
+        if self.roi is not None and any(value < 0 for value in self.roi):
+            raise ValueError("ROI coordinates and dimensions must be non-negative")
+        return self
 
 
 class CameraOption(BaseModel):
@@ -140,6 +158,12 @@ class CalibrationProfileRequest(BaseModel):
 
 class RoiConfig(BaseModel):
     roi: list[int] | None = Field(default=None, min_length=4, max_length=4)
+
+    @model_validator(mode="after")
+    def validate_roi_values(self) -> "RoiConfig":
+        if self.roi is not None and any(value < 0 for value in self.roi):
+            raise ValueError("ROI coordinates and dimensions must be non-negative")
+        return self
 
 
 class CalibrationQuality(BaseModel):
@@ -230,6 +254,7 @@ latest_motion_pixels: int = 0
 config_path = Path("config.json")
 history = deque(maxlen=50)
 roll_snapshots: dict[str, bytes] = {}
+STILL_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 
 
 def append_history(payload: RollPayload, request_id: str | None, snapshot_bytes: bytes | None = None) -> None:
@@ -735,6 +760,28 @@ def generate_fallback_roll(expected_dice_count: int) -> RollPayload:
         dice.append(DieResult(value=symbol, confidence=1.0, bbox=[0, 0, 0, 0]))
 
     return RollPayload(total_score=total_score, dice=dice, is_fallback=True)
+
+
+async def read_limited_request_body(request: Request, max_bytes: int) -> bytes:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_size = int(content_length)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header.") from error
+        if declared_size < 0:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header.")
+        if declared_size > max_bytes:
+            raise HTTPException(status_code=413, detail="Uploaded image is too large.")
+
+    chunks: list[bytes] = []
+    total_size = 0
+    async for chunk in request.stream():
+        total_size += len(chunk)
+        if total_size > max_bytes:
+            raise HTTPException(status_code=413, detail="Uploaded image is too large.")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def decode_image_bytes(image_bytes: bytes):
@@ -1356,7 +1403,7 @@ async def still_image_roll(request: Request) -> RollPayload:
     if not content_type.startswith("image/"):
         raise HTTPException(status_code=415, detail="Upload one image file.")
 
-    frame = decode_image_bytes(await request.body())
+    frame = decode_image_bytes(await read_limited_request_body(request, STILL_IMAGE_MAX_BYTES))
     parsed_results = vision.calculate_roll_from_still_image(frame)
     payload = build_roll_payload_from_dice(parsed_results)
 
@@ -1430,7 +1477,7 @@ async def fallback_roll() -> dict:
     global active_request_id, error_reset_task, watch_timeout_task
     if game_bridge_socket is None:
         raise HTTPException(status_code=409, detail="No active game bridge WebSocket connection.")
-    if active_request_id is None or runtime_state.system.status not in {"WATCHING", "CALCULATING"}:
+    if active_request_id is None or runtime_state.system.status != "WATCHING":
         raise HTTPException(status_code=409, detail="No active roll request is waiting for fallback.")
 
     cancel_task(watch_timeout_task)
